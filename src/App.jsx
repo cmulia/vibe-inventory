@@ -46,6 +46,10 @@ function normalizeUsername(u) {
     .replace(/\s+/g, "");
 }
 
+function normalizeDisplayName(nameRaw) {
+  return String(nameRaw || "").trim().replace(/\s+/g, " ");
+}
+
 function usernameToAuthEmail(usernameRaw) {
   const username = normalizeUsername(usernameRaw);
   const localPart = username.replace(/[^a-z0-9._-]/g, "");
@@ -205,6 +209,7 @@ function saveInventory(items) {
 
 export default function App() {
   const [currentUser, setCurrentUser] = useState("");
+  const [currentName, setCurrentName] = useState("");
   const [authIdentity, setAuthIdentity] = useState({ id: "", email: "" });
 
   const [authToast, setAuthToast] = useState("");
@@ -533,10 +538,11 @@ export default function App() {
     reader.readAsText(file);
   }
 
-  async function onSignup(usernameRaw, password) {
+  async function onSignup(nameRaw, usernameRaw, password) {
+    const name = normalizeDisplayName(nameRaw);
     const username = normalizeUsername(usernameRaw);
-    if (!username || !password) {
-      setAuthToast("Enter username + password");
+    if (!name || !username || !password) {
+      setAuthToast("Enter name + username + password");
       return;
     }
 
@@ -548,7 +554,7 @@ export default function App() {
     const { error } = await supabase.auth.signUp({
       email,
       password,
-      options: { data: { username } },
+      options: { data: { username, full_name: name } },
     });
 
     if (error) {
@@ -581,7 +587,11 @@ export default function App() {
       data?.user?.user_metadata?.username ||
       data?.user?.email?.split("@")?.[0] ||
       username;
+    const name =
+      normalizeDisplayName(data?.user?.user_metadata?.full_name) ||
+      normalizeDisplayName(data?.user?.user_metadata?.name);
     setCurrentUser(u);
+    setCurrentName(name || u);
     setAuthIdentity({
       id: data?.user?.id || "",
       email: data?.user?.email || "",
@@ -593,6 +603,7 @@ export default function App() {
   async function onLogout() {
     await supabase.auth.signOut();
     setCurrentUser("");
+    setCurrentName("");
     setAuthIdentity({ id: "", email: "" });
     setItems([]);
     setQuery("");
@@ -608,7 +619,11 @@ export default function App() {
       if (!s?.user) return;
 
       const u = s.user.user_metadata?.username || s.user.email?.split("@")?.[0] || "";
+      const name =
+        normalizeDisplayName(s.user.user_metadata?.full_name) ||
+        normalizeDisplayName(s.user.user_metadata?.name);
       setCurrentUser(u);
+      setCurrentName(name || u);
       setAuthIdentity({
         id: s.user.id || "",
         email: s.user.email || "",
@@ -618,7 +633,11 @@ export default function App() {
 
     const { data: sub } = supabase.auth.onAuthStateChange((_event, session) => {
       const u = session?.user?.user_metadata?.username || session?.user?.email?.split("@")?.[0] || "";
+      const name =
+        normalizeDisplayName(session?.user?.user_metadata?.full_name) ||
+        normalizeDisplayName(session?.user?.user_metadata?.name);
       setCurrentUser(u);
+      setCurrentName(name || u);
       setAuthIdentity({
         id: session?.user?.id || "",
         email: session?.user?.email || "",
@@ -646,7 +665,7 @@ export default function App() {
             <div style={styles.kicker}>Inventory Check</div>
             <h1 style={styles.h1}>Vibe Stocktake</h1>
             <div style={styles.sub}>
-              Logged in as <b>{currentUser}</b>
+              Welcome <b>{currentName || currentUser}</b>
               <button onClick={onLogout} style={{ ...styles.btnMini, marginLeft: 10 }}>
                 Logout
               </button>
@@ -771,6 +790,7 @@ export default function App() {
 
 function AuthScreen({ toast, onSignup, onLogin }) {
   const [mode, setMode] = useState("login"); // login | signup
+  const [name, setName] = useState("");
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
 
@@ -793,6 +813,14 @@ function AuthScreen({ toast, onSignup, onLogin }) {
           <div style={styles.cardTitle}>{mode === "login" ? "Login" : "Sign up"}</div>
 
           <div style={styles.form}>
+            {mode === "signup" ? (
+              <input
+                value={name}
+                onChange={(e) => setName(e.target.value)}
+                placeholder="Name"
+                style={styles.input}
+              />
+            ) : null}
             <input
               value={username}
               onChange={(e) => setUsername(e.target.value)}
@@ -812,7 +840,7 @@ function AuthScreen({ toast, onSignup, onLogin }) {
                 Login
               </button>
             ) : (
-              <button onClick={() => onSignup(username, password)} style={{ ...styles.btn, ...styles.btnPrimary }}>
+              <button onClick={() => onSignup(name, username, password)} style={{ ...styles.btn, ...styles.btnPrimary }}>
                 Create account
               </button>
             )}
