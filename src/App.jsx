@@ -663,7 +663,7 @@ export default function App() {
         <header style={styles.header}>
           <div>
             <div style={styles.kicker}>Inventory Check</div>
-            <h1 style={styles.h1}>Vibe Stocktake</h1>
+            <h1 style={styles.h1}>Vibe Inventory</h1>
             <div style={styles.sub}>
               Welcome <b>{currentName || currentUser}</b>
               <button onClick={onLogout} style={{ ...styles.btnMini, marginLeft: 10 }}>
