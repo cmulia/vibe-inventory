@@ -1,0 +1,21 @@
+:root {
+  color-scheme: dark;
+}
+
+html, body {
+  height: 100%;
+  margin: 0;
+  padding: 0;
+}
+
+body {
+  display: block;       /* important: remove flex centering */
+  overflow-x: hidden;   /* prevents right-side overflow */
+}
+
+#root {
+  width: 100%;
+  min-height: 100vh;
+  margin: 0;
+  padding: 0;           /* important: remove template padding */
+}
