@@ -4,7 +4,7 @@ import { supabase } from "./supabase";
 
 const USERS_KEY = "vibe_users_v1"; // registered users
 const SESSION_KEY = "vibe_session_v1"; // current logged-in username
-const CONSUMABLES_KEY = "vibe_consumables_v1";
+const CONSUMABLES_KEY = "vibe_consumables_v1"; // legacy local key (migration fallback)
 const THEME_KEY = "vibe_theme_v1";
 const CONSUMABLE_LOCATIONS = ["Clancy", "Scientia", "Science Theatre"];
 const ADMIN_USERNAMES = new Set(["admin"]);
@@ -235,24 +235,10 @@ function saveInventory(items) {
   localStorage.setItem(key, JSON.stringify(items));
 }
 
-function seedConsumables() {
-  const now = Date.now();
-  return [
-    { id: uid(), name: "AA Battery", category: "Power", unit: "pcs", location: "Clancy", onHand: 44, minLevel: 20, updatedAt: now },
-    { id: uid(), name: "Gaffer Tape", category: "Grip", unit: "rolls", location: "Scientia", onHand: 9, minLevel: 6, updatedAt: now },
-    { id: uid(), name: "Label Stickers", category: "Ops", unit: "packs", location: "Science Theatre", onHand: 2, minLevel: 4, updatedAt: now },
-  ];
-}
-
 function loadConsumables() {
   const raw = localStorage.getItem(CONSUMABLES_KEY);
   const parsed = raw ? parseJsonSafely(raw) : null;
-  if (Array.isArray(parsed)) return parsed;
-  return seedConsumables();
-}
-
-function saveConsumables(rows) {
-  localStorage.setItem(CONSUMABLES_KEY, JSON.stringify(rows));
+  return Array.isArray(parsed) ? parsed : [];
 }
 
 
@@ -270,12 +256,13 @@ export default function App() {
     const u = loadSession();
     return u ? loadInventory() : [];
   });
-  const [consumables, setConsumables] = useState(() => loadConsumables());
+  const [consumables, setConsumables] = useState([]);
 
   const [query, setQuery] = useState("");
   const [filter, setFilter] = useState("all"); // all | checked | missing
   const [sort, setSort] = useState("recent"); // recent | unsorted | name | location
   const [toast, setToast] = useState("");
+  const [toastLeaving, setToastLeaving] = useState(false);
   const [isAdding, setIsAdding] = useState(false);
   const [showAddDialog, setShowAddDialog] = useState(false);
   const [addError, setAddError] = useState("");
@@ -284,26 +271,34 @@ export default function App() {
 
   // load inventory when user changes
   useEffect(() => {
-  if (!currentUser) return;
-  loadInventoryFromDb();
-}, [currentUser]);
+    if (!currentUser) return;
+    loadInventoryFromDb();
+    loadConsumablesFromDb();
+  }, [currentUser]);
 
 
   // persist inventory when items change
 
   useEffect(() => {
     if (!toast) return;
-    const t = setTimeout(() => setToast(""), 1800);
-    return () => clearTimeout(t);
+    setToastLeaving(false);
+    const totalMs = 1800;
+    const leaveAtMs = 1580;
+    const tLeave = setTimeout(() => setToastLeaving(true), leaveAtMs);
+    const tClear = setTimeout(() => {
+      setToast("");
+      setToastLeaving(false);
+    }, totalMs);
+    return () => {
+      clearTimeout(tLeave);
+      clearTimeout(tClear);
+    };
   }, [toast]);
 
   useEffect(() => {
-    saveConsumables(consumables);
-  }, [consumables]);
-
-  useEffect(() => {
     if (!authToast) return;
-    const t = setTimeout(() => setAuthToast(""), 1800);
+    const isInvalidCred = /invalid login credentials/i.test(authToast);
+    const t = setTimeout(() => setAuthToast(""), isInvalidCred ? 60000 : 1800);
     return () => clearTimeout(t);
   }, [authToast]);
 
@@ -347,6 +342,53 @@ export default function App() {
 
   setItems(mapped);
 }
+
+  async function loadConsumablesFromDb() {
+    const { data, error } = await supabase
+      .from("consumables_items")
+      .select("id, created_at, name, category, unit, location, on_hand, min_level, updated_at")
+      .order("updated_at", { ascending: false });
+
+    if (error) {
+      setToast("Consumables load error: " + error.message);
+      return;
+    }
+
+    const rows = data || [];
+    if (rows.length === 0) {
+      const legacy = loadConsumables();
+      if (legacy.length > 0) {
+        const insertRows = legacy.map((x) => ({
+          id: String(x.id || genUuid()),
+          name: String(x.name || "Untitled"),
+          category: String(x.category || ""),
+          unit: String(x.unit || "pcs"),
+          location: String(x.location || CONSUMABLE_LOCATIONS[0]),
+          on_hand: Number(x.onHand || 0) || 0,
+          min_level: Number(x.minLevel || 0) || 0,
+        }));
+        const { error: insertError } = await supabase.from("consumables_items").insert(insertRows);
+        if (!insertError) {
+          localStorage.removeItem(CONSUMABLES_KEY);
+          await loadConsumablesFromDb();
+          return;
+        }
+      }
+    }
+
+    const mapped = (rows || []).map((r) => ({
+      id: String(r.id),
+      name: String(r.name || ""),
+      category: String(r.category || ""),
+      unit: String(r.unit || "pcs"),
+      location: String(r.location || CONSUMABLE_LOCATIONS[0]),
+      onHand: Number(r.on_hand || 0) || 0,
+      minLevel: Number(r.min_level || 0) || 0,
+      updatedAt: r.updated_at ? new Date(r.updated_at).getTime() : Date.now(),
+    }));
+
+    setConsumables(mapped);
+  }
 
 
   const stats = useMemo(() => {
@@ -634,45 +676,67 @@ export default function App() {
     reader.readAsText(file);
   }
 
-  function addConsumable(e) {
+  async function addConsumable(e) {
     e.preventDefault();
     if (!isAdmin) {
-      setToast("you don't have priviledge, please contact admin");
-      return;
+      setToast("You don't have priviledge, please contact admin");
+      return false;
     }
     const fd = new FormData(e.currentTarget);
     const name = String(fd.get("name") || "").trim();
-    if (!name) return;
+    if (!name) return false;
     const category = String(fd.get("category") || "").trim();
     const unit = String(fd.get("unit") || "").trim() || "pcs";
     const location = String(fd.get("location") || "").trim() || CONSUMABLE_LOCATIONS[0];
     const onHand = Number(fd.get("onHand") || 0) || 0;
     const minLevel = Number(fd.get("minLevel") || 0) || 0;
 
-    setConsumables((prev) => [
-      { id: uid(), name, category, unit, location, onHand, minLevel, updatedAt: Date.now() },
-      ...prev,
-    ]);
+    const row = {
+      id: genUuid(),
+      name,
+      category,
+      unit,
+      location,
+      on_hand: onHand,
+      min_level: minLevel,
+    };
+    const { error } = await supabase.from("consumables_items").insert([row], { returning: "minimal" });
+    if (error) {
+      setToast("Consumable add error: " + error.message);
+      return false;
+    }
+    await loadConsumablesFromDb();
     e.currentTarget.reset();
     setToast("Consumable added");
+    return true;
   }
 
-  function adjustConsumable(id, delta) {
-    setConsumables((prev) =>
-      prev.map((c) =>
-        c.id === id
-          ? { ...c, onHand: Math.max(0, Number(c.onHand || 0) + delta), updatedAt: Date.now() }
-          : c
-      )
-    );
-  }
-
-  function removeConsumable(id) {
-    if (!isAdmin) {
-      setToast("you don't have priviledge, please contact admin");
+  async function adjustConsumable(id, delta) {
+    const current = consumables.find((c) => c.id === id);
+    if (!current) return;
+    const nextOnHand = Math.max(0, Number(current.onHand || 0) + delta);
+    const { error } = await supabase
+      .from("consumables_items")
+      .update({ on_hand: nextOnHand, updated_at: new Date().toISOString() })
+      .eq("id", id);
+    if (error) {
+      setToast("Consumable update error: " + error.message);
       return;
     }
-    setConsumables((prev) => prev.filter((c) => c.id !== id));
+    await loadConsumablesFromDb();
+  }
+
+  async function removeConsumable(id) {
+    if (!isAdmin) {
+      setToast("You don't have priviledge, please contact admin");
+      return;
+    }
+    const { error } = await supabase.from("consumables_items").delete().eq("id", id);
+    if (error) {
+      setToast("Consumable delete error: " + error.message);
+      return;
+    }
+    await loadConsumablesFromDb();
     setToast("Consumable removed");
   }
 
@@ -747,6 +811,7 @@ export default function App() {
     setShowAddDialog(false);
     setAuthIdentity({ id: "", email: "" });
     setItems([]);
+    setConsumables([]);
     setQuery("");
     setFilter("all");
     setSort("recent");
@@ -814,8 +879,8 @@ export default function App() {
       <div style={styles.container}>
         <header style={styles.header} className="fade-up">
           <div>
-            <div style={styles.kicker}>Operations Workspace</div>
-            <h1 style={styles.h1}>Inventory Workspace</h1>
+            <div style={styles.kicker}>UNSW Venue & Event Services</div>
+            <h1 style={styles.h1}>Inventory Check</h1>
             <div style={styles.sub}>
               Signed in as <b>{currentName || currentUser}</b>
               <span style={{ ...styles.rolePill, ...(isAdmin ? styles.roleAdmin : styles.roleUser) }}>
@@ -823,12 +888,6 @@ export default function App() {
               </span>
               <button onClick={onLogout} style={{ ...styles.btnMini, marginLeft: 10 }}>
                 Logout
-              </button>
-              <button
-                onClick={() => setTheme((t) => (t === "dark" ? "light" : "dark"))}
-                style={{ ...styles.btnMini, ...styles.btnMiniGhost, marginLeft: 8 }}
-              >
-                {theme === "dark" ? "Light mode" : "Dark mode"}
               </button>
             </div>
           </div>
@@ -872,7 +931,7 @@ export default function App() {
         </div>
 
         {activePage === "overview" ? (
-          <OverviewPage consumableStats={consumableStats} consumables={consumables} />
+          <OverviewPage consumableStats={consumableStats} consumables={consumables} isAdmin={isAdmin} />
         ) : null}
 
         {activePage === "equipment" && isAdmin ? (
@@ -882,7 +941,7 @@ export default function App() {
               <button
                 onClick={() => {
                   if (!isAdmin) {
-                    setToast("you don't have priviledge, please contact admin");
+                    setToast("You don't have priviledge, please contact admin");
                     return;
                   }
                   setAddError("");
@@ -991,7 +1050,7 @@ export default function App() {
             onAdd={addConsumable}
             onAdjust={adjustConsumable}
             onDelete={removeConsumable}
-            onNoPrivilege={() => setToast("you don't have priviledge, please contact admin")}
+            onNoPrivilege={() => setToast("You don't have priviledge, please contact admin")}
           />
         ) : null}
 
@@ -1043,8 +1102,22 @@ export default function App() {
           </div>
         ) : null}
 
-        {toast ? <div style={styles.toast}>{toast}</div> : null}
-        <footer style={styles.footer}>Built by Chris Mulia.</footer>
+        <button
+          onClick={() => setTheme((t) => (t === "dark" ? "light" : "dark"))}
+          style={styles.themeToggleFloating}
+        >
+          {theme === "dark" ? "Light mode" : "Dark mode"}
+        </button>
+
+        {toast ? (
+          <div
+            className="toast-pop"
+            style={{ ...styles.toast, ...(toastLeaving ? styles.toastOut : styles.toastIn) }}
+          >
+            {toast}
+          </div>
+        ) : null}
+        <footer style={styles.footer}>Any questions please reach out to Full-Time staff</footer>
       </div>
     </div>
   );
@@ -1067,13 +1140,10 @@ function AuthScreen({ toast, onSignup, onLogin, theme, onToggleTheme }) {
       <div style={styles.container}>
         <header style={styles.header} className="fade-up">
           <div>
-            <div style={styles.kicker}>OpenAI-inspired Console</div>
-            <h1 style={styles.h1}>Inventory Workspace</h1>
-            <div style={styles.sub}>Secure auth with Supabase.</div>
+            <div style={styles.kicker}>UNSW Venue & Event Services</div>
+            <h1 style={styles.h1}>Inventory Check</h1>
+            <div style={styles.sub}>Secure login</div>
           </div>
-          <button onClick={onToggleTheme} style={{ ...styles.btnMini, ...styles.btnMiniGhost }}>
-            {theme === "dark" ? "Light mode" : "Dark mode"}
-          </button>
         </header>
 
         <section style={{ ...styles.card, maxWidth: 520 }} className="fade-up">
@@ -1122,37 +1192,28 @@ function AuthScreen({ toast, onSignup, onLogin, theme, onToggleTheme }) {
             {toast ? <div style={{ marginTop: 10, opacity: 0.9 }}>{toast}</div> : null}
           </div>
         </section>
+        <button onClick={onToggleTheme} style={styles.themeToggleFloating}>
+          {theme === "dark" ? "Light mode" : "Dark mode"}
+        </button>
       </div>
     </div>
   );
 }
 
-function OverviewPage({ consumableStats, consumables }) {
+function OverviewPage({ consumableStats, consumables, isAdmin }) {
   const recentConsumables = [...consumables].sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0)).slice(0, 5);
   const lowRows = consumables
     .filter((c) => Number(c.onHand || 0) <= Number(c.minLevel || 0))
     .slice(0, 5);
 
   return (
-    <div style={{ ...styles.grid, gridTemplateColumns: "repeat(auto-fit, minmax(280px, 1fr))" }}>
+    <div style={{ ...styles.grid, gridTemplateColumns: "repeat(auto-fit, minmax(320px, 1fr))" }}>
       <section style={styles.card} className="fade-up">
         <div style={styles.cardTitle}>Consumables snapshot</div>
         <div style={styles.overviewStatStack}>
           <div style={styles.overviewStatRow}><span>Total SKUs</span><b>{consumableStats.total}</b></div>
           <div style={styles.overviewStatRow}><span>Low stock</span><b>{consumableStats.low}</b></div>
           <div style={styles.overviewStatRow}><span>Healthy</span><b>{consumableStats.healthy}</b></div>
-        </div>
-      </section>
-
-      <section style={{ ...styles.card, ...styles.cardTall }} className="fade-up">
-        <div style={styles.cardTitle}>Recent consumables activity</div>
-        <div style={styles.list}>
-          {recentConsumables.length ? recentConsumables.map((c) => (
-            <div key={c.id} style={styles.overviewRow}>
-              <div style={styles.overviewMainText}>{c.name}</div>
-              <div style={styles.overviewSubText}>{c.onHand} {c.unit || "pcs"} on hand · {fmtTime(c.updatedAt)}</div>
-            </div>
-          )) : <div style={styles.empty}>No recent activity.</div>}
         </div>
       </section>
 
@@ -1169,6 +1230,22 @@ function OverviewPage({ consumableStats, consumables }) {
           )) : <div style={styles.empty}>No low-stock consumables.</div>}
         </div>
       </section>
+
+      {isAdmin ? (
+        <section style={{ ...styles.card, ...styles.cardTall, ...styles.overviewWideCard }} className="fade-up">
+          <div style={styles.cardTitle}>Recent consumables activity</div>
+          <div style={styles.list}>
+            {recentConsumables.length ? recentConsumables.map((c) => (
+              <div key={c.id} style={styles.overviewRow}>
+                <div style={styles.overviewMainText}>{c.name}</div>
+                <div style={styles.overviewSubText}>
+                  {c.onHand} {c.unit || "pcs"} on hand · {c.location || "Unassigned"} · {fmtTime(c.updatedAt)}
+                </div>
+              </div>
+            )) : <div style={styles.empty}>No recent activity.</div>}
+          </div>
+        </section>
+      ) : null}
     </div>
   );
 }
@@ -1201,9 +1278,9 @@ function ConsumablesPage({ consumables, isAdmin, onAdd, onAdjust, onDelete, onNo
     setShowAddConsumable(true);
   }
 
-  function submitAddConsumable(e) {
-    onAdd(e);
-    setShowAddConsumable(false);
+  async function submitAddConsumable(e) {
+    const ok = await onAdd(e);
+    if (ok) setShowAddConsumable(false);
   }
 
   return (
@@ -1212,19 +1289,19 @@ function ConsumablesPage({ consumables, isAdmin, onAdd, onAdjust, onDelete, onNo
         <div style={styles.listTop}>
           <div style={styles.cardTitle}>Consumables gallery</div>
           <div style={styles.listControls}>
-            <div style={styles.locationButtonRow}>
-              <div style={styles.locationStarter}>
-                {locationFilter || "Choose a location"}
+            <div style={styles.locationFilterBlock}>
+              <div style={styles.locationLabel}>Choose a location</div>
+              <div style={styles.locationButtonRow}>
+                {CONSUMABLE_LOCATIONS.map((loc) => (
+                  <button
+                    key={loc}
+                    onClick={() => setLocationFilter(loc)}
+                    style={{ ...styles.locationBtn, ...(locationFilter === loc ? styles.locationBtnActive : {}) }}
+                  >
+                    {loc}
+                  </button>
+                ))}
               </div>
-              {CONSUMABLE_LOCATIONS.map((loc) => (
-                <button
-                  key={loc}
-                  onClick={() => setLocationFilter(loc)}
-                  style={{ ...styles.locationBtn, ...(locationFilter === loc ? styles.locationBtnActive : {}) }}
-                >
-                  {loc}
-                </button>
-              ))}
             </div>
             <button onClick={openAddConsumable} style={{ ...styles.plusBtn, ...(isAdmin ? {} : styles.plusBtnLocked) }}>
               +
@@ -1600,21 +1677,20 @@ const styles = {
     filter: "grayscale(0.45)",
     cursor: "not-allowed",
   },
+  locationFilterBlock: {
+    display: "flex",
+    flexDirection: "column",
+    gap: 8,
+  },
+  locationLabel: {
+    fontSize: 13,
+    fontWeight: 700,
+    color: "var(--text-muted)",
+  },
   locationButtonRow: {
     display: "flex",
     flexWrap: "wrap",
     gap: 8,
-  },
-  locationStarter: {
-    minHeight: 50,
-    padding: "12px 16px",
-    borderRadius: 12,
-    border: "1px dashed var(--dash-border)",
-    background: "var(--ghost-bg)",
-    color: "var(--text-muted)",
-    display: "grid",
-    placeItems: "center",
-    fontWeight: 700,
   },
   locationBtn: {
     minHeight: 50,
@@ -1839,6 +1915,10 @@ const styles = {
     border: "1px solid var(--card-border)",
     background: "var(--panel-bg)",
   },
+  overviewWideCard: {
+    gridColumn: "1 / -1",
+    minHeight: 260,
+  },
   lowStockCard: {
     border: "1px solid rgba(239, 68, 68, 0.5)",
     boxShadow: "0 0 0 1px rgba(239, 68, 68, 0.24), var(--shadow-elev)",
@@ -1970,6 +2050,15 @@ const styles = {
     backdropFilter: "blur(14px)",
     fontWeight: 700,
     boxShadow: "var(--accent-shadow)",
+    transition: "opacity 220ms ease, transform 220ms ease",
+  },
+  toastIn: {
+    opacity: 1,
+    transform: "translateX(-50%) translateY(0) scale(1)",
+  },
+  toastOut: {
+    opacity: 0,
+    transform: "translateX(-50%) translateY(10px) scale(0.98)",
   },
   modalBackdrop: {
     position: "fixed",
@@ -2007,6 +2096,20 @@ const styles = {
     display: "flex",
     gap: 10,
     flexWrap: "wrap",
+  },
+  themeToggleFloating: {
+    position: "absolute",
+    top: 14,
+    right: 14,
+    zIndex: 1300,
+    padding: "9px 12px",
+    borderRadius: 999,
+    border: "1px solid var(--field-border)",
+    background: "var(--panel-bg)",
+    color: "var(--text-primary)",
+    fontWeight: 700,
+    cursor: "pointer",
+    boxShadow: "var(--accent-shadow)",
   },
   footer: { marginTop: 14, opacity: 0.66, fontSize: 12.5, color: "var(--text-muted)" },
 };
