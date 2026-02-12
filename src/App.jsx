@@ -114,12 +114,15 @@ async function loadProfileMapForActorIds(actorIds) {
   return out;
 }
 
-async function upsertCurrentUserProfile(user) {
+async function upsertCurrentUserProfile(user, realEmail = "") {
   if (!user?.id) return;
+  const email = realEmail || user?.user_metadata?.real_email || user?.email || "";
   await supabase.from("user_profiles").upsert(
     {
       user_id: user.id,
       email: user.email || "",
+      real_email: email,
+      email_verified: false,
     },
     { onConflict: "user_id" }
   );
@@ -779,6 +782,9 @@ export default function App() {
     const current = consumables.find((c) => c.id === id);
     if (!current) return;
     const nextOnHand = Math.max(0, Number(current.onHand || 0) + delta);
+    const currentOnHand = Number(current.onHand || 0);
+    const minLevel = Number(current.minLevel || 0);
+
     const { error } = await supabase
       .from("consumables_items")
       .update({
@@ -792,6 +798,38 @@ export default function App() {
       setToast("Consumable update error: " + error.message);
       return;
     }
+
+    // Trigger notification if stock just went below minimum
+    const wasAboveMin = currentOnHand > minLevel;
+    const isNowBelowMin = nextOnHand <= minLevel;
+    if (wasAboveMin && isNowBelowMin && isAdmin) {
+      try {
+        const payload = {
+          consumable_id: id,
+          name: current.name || "Unknown",
+          on_hand: nextOnHand,
+          min_level: minLevel,
+          location: current.location || "Unknown",
+          unit: current.unit || "pcs",
+          updated_by_name: currentName || currentUser || "Unknown",
+        };
+        console.log("Calling notify-low-stock with payload:", payload);
+        const response = await fetch(
+          `${import.meta.env.VITE_SUPABASE_URL}/functions/v1/notify-low-stock`,
+          {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(payload),
+          }
+        );
+        console.log("notify-low-stock response status:", response.status);
+        const responseData = await response.json();
+        console.log("notify-low-stock response data:", responseData);
+      } catch (err) {
+        console.error("Failed to trigger notification:", err);
+      }
+    }
+
     await loadConsumablesFromDb();
   }
 
@@ -849,11 +887,15 @@ export default function App() {
     setToast(nextResolved ? "Marked resolved" : "Marked unresolved");
   }
 
-  async function onSignup(nameRaw, usernameRaw, password) {
+  async function onSignup(nameRaw, usernameRaw, emailRaw, password) {
     const name = normalizeDisplayName(nameRaw);
     const username = normalizeUsername(usernameRaw);
     if (!name || !username || !password) {
       setAuthToast("Enter name + username + password");
+      return;
+    }
+    if (!emailRaw || !emailRaw.includes("@")) {
+      setAuthToast("Enter a valid email address");
       return;
     }
 
@@ -865,7 +907,7 @@ export default function App() {
     const { error } = await supabase.auth.signUp({
       email,
       password,
-      options: { data: { username, full_name: name } },
+      options: { data: { username, full_name: name, real_email: emailRaw } },
     });
 
     if (error) {
@@ -901,6 +943,7 @@ export default function App() {
     const name =
       normalizeDisplayName(data?.user?.user_metadata?.full_name) ||
       normalizeDisplayName(data?.user?.user_metadata?.name);
+    const realEmail = data?.user?.user_metadata?.real_email || "";
     setCurrentUser(u);
     setCurrentName(name || u);
     setIsAdmin(isAdminIdentity(data?.user, u));
@@ -908,7 +951,7 @@ export default function App() {
       id: data?.user?.id || "",
       email: data?.user?.email || "",
     });
-    await upsertCurrentUserProfile(data?.user);
+    await upsertCurrentUserProfile(data?.user, realEmail);
     setAuthToast("Logged in");
   }
 
@@ -939,6 +982,7 @@ export default function App() {
       const name =
         normalizeDisplayName(s.user.user_metadata?.full_name) ||
         normalizeDisplayName(s.user.user_metadata?.name);
+      const realEmail = s.user.user_metadata?.real_email || "";
       setCurrentUser(u);
       setCurrentName(name || u);
       setIsAdmin(isAdminIdentity(s.user, u));
@@ -946,7 +990,7 @@ export default function App() {
         id: s.user.id || "",
         email: s.user.email || "",
       });
-      upsertCurrentUserProfile(s.user);
+      upsertCurrentUserProfile(s.user, realEmail);
     });
 
     const { data: sub } = supabase.auth.onAuthStateChange((_event, session) => {
@@ -954,6 +998,7 @@ export default function App() {
       const name =
         normalizeDisplayName(session?.user?.user_metadata?.full_name) ||
         normalizeDisplayName(session?.user?.user_metadata?.name);
+      const realEmail = session?.user?.user_metadata?.real_email || "";
       setCurrentUser(u);
       setCurrentName(name || u);
       setIsAdmin(isAdminIdentity(session?.user, u));
@@ -961,7 +1006,7 @@ export default function App() {
         id: session?.user?.id || "",
         email: session?.user?.email || "",
       });
-      upsertCurrentUserProfile(session?.user);
+      upsertCurrentUserProfile(session?.user, realEmail);
     });
 
     return () => sub.subscription.unsubscribe();
@@ -1316,6 +1361,7 @@ function AuthScreen({ toast, onSignup, onLogin, theme, onToggleTheme }) {
   const [mode, setMode] = useState("login"); // login | signup
   const [name, setName] = useState("");
   const [username, setUsername] = useState("");
+  const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
 
   return (
@@ -1339,12 +1385,21 @@ function AuthScreen({ toast, onSignup, onLogin, theme, onToggleTheme }) {
 
           <div style={styles.form}>
             {mode === "signup" ? (
-              <input
-                value={name}
-                onChange={(e) => setName(e.target.value)}
-                placeholder="Name"
-                style={styles.input}
-              />
+              <>
+                <input
+                  value={name}
+                  onChange={(e) => setName(e.target.value)}
+                  placeholder="Name"
+                  style={styles.input}
+                />
+                <input
+                  value={email}
+                  onChange={(e) => setEmail(e.target.value)}
+                  placeholder="Email address"
+                  type="email"
+                  style={styles.input}
+                />
+              </>
             ) : null}
             <input
               value={username}
@@ -1365,7 +1420,7 @@ function AuthScreen({ toast, onSignup, onLogin, theme, onToggleTheme }) {
                 Login
               </button>
             ) : (
-              <button onClick={() => onSignup(name, username, password)} style={{ ...styles.btn, ...styles.btnPrimary }}>
+              <button onClick={() => onSignup(name, username, email, password)} style={{ ...styles.btn, ...styles.btnPrimary }}>
                 Create account
               </button>
             )}
