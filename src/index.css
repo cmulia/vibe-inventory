@@ -1,21 +1,181 @@
+@import url("https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&family=Sora:wght@500;600;700&display=swap");
+
 :root {
   color-scheme: dark;
+  --text-primary: rgba(236, 241, 247, 0.96);
+  --text-soft: rgba(203, 213, 225, 0.95);
+  --text-muted: rgba(148, 163, 184, 0.96);
+  --mesh-line: rgba(148, 163, 184, 0.07);
+  --page-bg: radial-gradient(1300px 720px at 12% -12%, rgba(45, 212, 191, 0.2), transparent 62%),
+    radial-gradient(900px 640px at 92% 4%, rgba(34, 197, 94, 0.14), transparent 60%),
+    linear-gradient(180deg, #05080d 0%, #090d14 52%, #0b1118 100%);
+  --card-bg: linear-gradient(180deg, rgba(15, 23, 42, 0.82), rgba(10, 15, 26, 0.74));
+  --card-border: rgba(148, 163, 184, 0.2);
+  --panel-bg: linear-gradient(180deg, rgba(15, 23, 42, 0.85), rgba(15, 23, 42, 0.64));
+  --panel-border: rgba(148, 163, 184, 0.24);
+  --field-bg: rgba(2, 6, 23, 0.56);
+  --field-border: rgba(148, 163, 184, 0.28);
+  --ghost-bg: rgba(2, 6, 23, 0.5);
+  --divider: rgba(148, 163, 184, 0.22);
+  --dash-border: rgba(148, 163, 184, 0.28);
+  --accent-border: rgba(16, 185, 129, 0.52);
+  --accent-bg: linear-gradient(180deg, rgba(16, 185, 129, 0.24), rgba(8, 47, 73, 0.64));
+  --accent-shadow: 0 8px 20px rgba(16, 185, 129, 0.18);
+  --tab-bg: rgba(15, 23, 42, 0.56);
+  --tab-border: rgba(148, 163, 184, 0.24);
+  --tab-text: rgba(203, 213, 225, 0.95);
+  --tab-active-border: rgba(16, 185, 129, 0.5);
+  --tab-active-bg: linear-gradient(180deg, rgba(16, 185, 129, 0.24), rgba(8, 47, 73, 0.62));
+  --tab-active-text: #ecfeff;
+  --chip-bg: rgba(30, 41, 59, 0.66);
+  --chip-border: rgba(148, 163, 184, 0.26);
+  --chip-soft-bg: rgba(12, 74, 110, 0.46);
+  --chip-soft-border: rgba(56, 189, 248, 0.28);
+  --toast-bg: rgba(2, 6, 23, 0.88);
+  --toast-border: rgba(16, 185, 129, 0.38);
+  --overlay-bg: rgba(2, 6, 23, 0.68);
+  --shadow-elev: 0 22px 50px rgba(0, 0, 0, 0.45), inset 0 1px 0 rgba(255, 255, 255, 0.04);
+  --shadow-modal: 0 24px 70px rgba(0, 0, 0, 0.55);
+  --body-bg: #060a11;
 }
 
-html, body {
+[data-theme="light"] {
+  color-scheme: light;
+  --text-primary: #0f172a;
+  --text-soft: #334155;
+  --text-muted: #64748b;
+  --mesh-line: rgba(148, 163, 184, 0.13);
+  --page-bg: radial-gradient(1300px 720px at 12% -12%, rgba(250, 204, 21, 0.2), transparent 62%),
+    radial-gradient(900px 640px at 92% 4%, rgba(245, 158, 11, 0.16), transparent 60%),
+    linear-gradient(180deg, #fffdf4 0%, #fff7db 45%, #fef3c7 100%);
+  --card-bg: linear-gradient(180deg, rgba(255, 255, 255, 0.62), rgba(255, 255, 255, 0.48));
+  --card-border: rgba(255, 255, 255, 0.75);
+  --panel-bg: linear-gradient(180deg, rgba(255, 255, 255, 0.68), rgba(255, 255, 255, 0.5));
+  --panel-border: rgba(255, 255, 255, 0.82);
+  --field-bg: rgba(255, 255, 255, 0.72);
+  --field-border: rgba(234, 179, 8, 0.3);
+  --ghost-bg: rgba(255, 255, 255, 0.58);
+  --divider: rgba(234, 179, 8, 0.22);
+  --dash-border: rgba(234, 179, 8, 0.38);
+  --accent-border: rgba(245, 158, 11, 0.6);
+  --accent-bg: linear-gradient(180deg, rgba(251, 191, 36, 0.52), rgba(245, 158, 11, 0.34));
+  --accent-shadow: 0 10px 22px rgba(245, 158, 11, 0.18);
+  --tab-bg: rgba(255, 255, 255, 0.62);
+  --tab-border: rgba(255, 255, 255, 0.75);
+  --tab-text: #334155;
+  --tab-active-border: rgba(245, 158, 11, 0.64);
+  --tab-active-bg: linear-gradient(180deg, rgba(251, 191, 36, 0.5), rgba(245, 158, 11, 0.3));
+  --tab-active-text: #422006;
+  --chip-bg: rgba(255, 255, 255, 0.7);
+  --chip-border: rgba(234, 179, 8, 0.28);
+  --chip-soft-bg: rgba(254, 243, 199, 0.86);
+  --chip-soft-border: rgba(234, 179, 8, 0.4);
+  --toast-bg: rgba(255, 255, 255, 0.86);
+  --toast-border: rgba(245, 158, 11, 0.6);
+  --overlay-bg: rgba(254, 249, 195, 0.56);
+  --shadow-elev: 0 20px 45px rgba(120, 53, 15, 0.16), inset 0 1px 0 rgba(255, 255, 255, 0.8);
+  --shadow-modal: 0 20px 60px rgba(120, 53, 15, 0.2);
+  --body-bg: #fff7db;
+}
+
+html,
+body {
   height: 100%;
   margin: 0;
   padding: 0;
+  overflow: hidden;
+}
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
 }
 
 body {
-  display: block;       /* important: remove flex centering */
-  overflow-x: hidden;   /* prevents right-side overflow */
+  display: block;
+  text-rendering: geometricPrecision;
+  -webkit-font-smoothing: antialiased;
+  background: var(--body-bg);
+}
+
+html {
+  overflow: hidden;
 }
 
 #root {
   width: 100%;
+  height: 100dvh;
   min-height: 100vh;
   margin: 0;
-  padding: 0;           /* important: remove template padding */
+  padding: 0;
+  overflow-x: hidden;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
+
+input::placeholder {
+  color: var(--text-muted);
+}
+
+input:focus,
+select:focus,
+button:focus-visible {
+  outline: none;
+  border-color: var(--accent-border) !important;
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent-border) 26%, transparent);
+}
+
+button:hover {
+  transform: translateY(-1px);
+}
+
+@media (max-width: 1120px) {
+  .fade-up {
+    animation-duration: 420ms;
+  }
+}
+
+.fade-up {
+  animation: fadeUp 520ms cubic-bezier(0.2, 0.8, 0.2, 1) both;
+}
+
+@keyframes fadeUp {
+  from {
+    opacity: 0;
+    transform: translateY(14px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.consumable-gallery {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+
+.consumable-quick-add {
+  grid-template-columns: 2fr 1.2fr 1fr 0.9fr 0.8fr auto;
+}
+
+@media (max-width: 1100px) {
+  .consumable-gallery {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+  .consumable-quick-add {
+    grid-template-columns: 1fr 1fr;
+  }
+}
+
+@media (max-width: 700px) {
+  .consumable-gallery {
+    grid-template-columns: 1fr;
+  }
+  .consumable-quick-add {
+    grid-template-columns: 1fr;
+  }
+  button {
+    min-height: 44px;
+  }
 }

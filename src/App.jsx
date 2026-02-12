@@ -4,6 +4,11 @@ import { supabase } from "./supabase";
 
 const USERS_KEY = "vibe_users_v1"; // registered users
 const SESSION_KEY = "vibe_session_v1"; // current logged-in username
+const CONSUMABLES_KEY = "vibe_consumables_v1";
+const THEME_KEY = "vibe_theme_v1";
+const CONSUMABLE_LOCATIONS = ["Clancy", "Scientia", "Science Theatre"];
+const ADMIN_USERNAMES = new Set(["admin"]);
+const ADMIN_EMAILS = new Set(["admin@vibe-user.example.com"]);
 
 function uid() {
   return Math.random().toString(16).slice(2) + Date.now().toString(16);
@@ -50,10 +55,28 @@ function normalizeDisplayName(nameRaw) {
   return String(nameRaw || "").trim().replace(/\s+/g, " ");
 }
 
+function isAdminIdentity(user, usernameHint = "") {
+  const username = normalizeUsername(user?.user_metadata?.username || usernameHint);
+  const email = String(user?.email || "").toLowerCase();
+  const role = String(user?.user_metadata?.role || "").toLowerCase();
+  return role === "admin" || ADMIN_USERNAMES.has(username) || ADMIN_EMAILS.has(email);
+}
+
 function usernameToAuthEmail(usernameRaw) {
   const username = normalizeUsername(usernameRaw);
   const localPart = username.replace(/[^a-z0-9._-]/g, "");
   return localPart ? `${localPart}@vibe-user.example.com` : "";
+}
+
+function actorDisplayName(value) {
+  const raw = String(value || "").trim();
+  if (!raw) return "?";
+  if (raw.includes("@")) {
+    const local = raw.split("@")[0] || "";
+    const normalized = local.replace(/[._-]+/g, " ").trim();
+    return normalized || local || raw;
+  }
+  return raw;
 }
 
 function mapDbItem(row, actorMap = {}) {
@@ -67,9 +90,9 @@ function mapDbItem(row, actorMap = {}) {
     qty: row.qty ?? 1,
     checked: !!row.checked,
     note: row.notes ?? "",
-    createdBy: actorMap[createdByRaw] || createdByRaw,
+    createdBy: actorDisplayName(actorMap[createdByRaw] || createdByRaw),
     createdAt: row.created_at ? new Date(row.created_at).getTime() : Date.now(),
-    updatedBy: actorMap[updatedByRaw] || updatedByRaw,
+    updatedBy: actorDisplayName(actorMap[updatedByRaw] || updatedByRaw),
     updatedAt: row.updated_at ? new Date(row.updated_at).getTime() : Date.now(),
   };
 }
@@ -105,7 +128,13 @@ async function upsertCurrentUserProfile(user) {
 function fmtTime(ms) {
   if (!ms) return "";
   const d = new Date(ms);
-  return d.toLocaleString();
+  return d.toLocaleString([], {
+    year: "numeric",
+    month: "short",
+    day: "numeric",
+    hour: "numeric",
+    minute: "2-digit",
+  });
 }
 
 async function sha256(text) {
@@ -206,10 +235,33 @@ function saveInventory(items) {
   localStorage.setItem(key, JSON.stringify(items));
 }
 
+function seedConsumables() {
+  const now = Date.now();
+  return [
+    { id: uid(), name: "AA Battery", category: "Power", unit: "pcs", location: "Clancy", onHand: 44, minLevel: 20, updatedAt: now },
+    { id: uid(), name: "Gaffer Tape", category: "Grip", unit: "rolls", location: "Scientia", onHand: 9, minLevel: 6, updatedAt: now },
+    { id: uid(), name: "Label Stickers", category: "Ops", unit: "packs", location: "Science Theatre", onHand: 2, minLevel: 4, updatedAt: now },
+  ];
+}
+
+function loadConsumables() {
+  const raw = localStorage.getItem(CONSUMABLES_KEY);
+  const parsed = raw ? parseJsonSafely(raw) : null;
+  if (Array.isArray(parsed)) return parsed;
+  return seedConsumables();
+}
+
+function saveConsumables(rows) {
+  localStorage.setItem(CONSUMABLES_KEY, JSON.stringify(rows));
+}
+
 
 export default function App() {
   const [currentUser, setCurrentUser] = useState("");
   const [currentName, setCurrentName] = useState("");
+  const [isAdmin, setIsAdmin] = useState(false);
+  const [theme, setTheme] = useState(() => localStorage.getItem(THEME_KEY) || "dark");
+  const [activePage, setActivePage] = useState("consumables"); // overview | equipment | consumables
   const [authIdentity, setAuthIdentity] = useState({ id: "", email: "" });
 
   const [authToast, setAuthToast] = useState("");
@@ -218,12 +270,14 @@ export default function App() {
     const u = loadSession();
     return u ? loadInventory() : [];
   });
+  const [consumables, setConsumables] = useState(() => loadConsumables());
 
   const [query, setQuery] = useState("");
   const [filter, setFilter] = useState("all"); // all | checked | missing
-  const [sort, setSort] = useState("recent"); // recent | name | location
+  const [sort, setSort] = useState("recent"); // recent | unsorted | name | location
   const [toast, setToast] = useState("");
   const [isAdding, setIsAdding] = useState(false);
+  const [showAddDialog, setShowAddDialog] = useState(false);
   const [addError, setAddError] = useState("");
   const [addDebug, setAddDebug] = useState("");
   const fileRef = useRef(null);
@@ -244,16 +298,32 @@ export default function App() {
   }, [toast]);
 
   useEffect(() => {
+    saveConsumables(consumables);
+  }, [consumables]);
+
+  useEffect(() => {
     if (!authToast) return;
     const t = setTimeout(() => setAuthToast(""), 1800);
     return () => clearTimeout(t);
   }, [authToast]);
 
+  useEffect(() => {
+    const next = theme === "light" ? "light" : "dark";
+    document.documentElement.setAttribute("data-theme", next);
+    localStorage.setItem(THEME_KEY, next);
+  }, [theme]);
+
+  useEffect(() => {
+    if (!isAdmin && activePage === "equipment") {
+      setActivePage("consumables");
+    }
+  }, [isAdmin, activePage]);
+
   async function loadInventoryFromDb() {
   const { data, error } = await supabase
     .from("inventory_items")
     .select("id, created_at, item_name, tag, location, qty, checked, notes, created_by, updated_at, updated_by")
-    .order("updated_at", { ascending: false });
+    .order("created_at", { ascending: false });
 
   if (error) {
     setToast("Load error: " + error.message);
@@ -270,7 +340,9 @@ export default function App() {
     )
   );
   const actorMap = await loadProfileMapForActorIds(actorIds);
-  if (authIdentity?.id && authIdentity?.email) actorMap[authIdentity.id] = authIdentity.email;
+  if (authIdentity?.id && authIdentity?.email) {
+    actorMap[authIdentity.id] = actorDisplayName(authIdentity.email);
+  }
   const mapped = rows.map((r) => mapDbItem(r, actorMap));
 
   setItems(mapped);
@@ -283,6 +355,13 @@ export default function App() {
     const missing = total - checked;
     return { total, checked, missing };
   }, [items]);
+
+  const consumableStats = useMemo(() => {
+    const total = consumables.length;
+    const low = consumables.filter((c) => Number(c.onHand || 0) <= Number(c.minLevel || 0)).length;
+    const healthy = total - low;
+    return { total, low, healthy };
+  }, [consumables]);
 
   const filtered = useMemo(() => {
     const q = query.trim().toLowerCase();
@@ -298,6 +377,7 @@ export default function App() {
 
     if (sort === "recent")
       out = [...out].sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
+    if (sort === "unsorted") out = [...out];
     if (sort === "name") out = [...out].sort((a, b) => a.name.localeCompare(b.name));
     if (sort === "location")
       out = [...out].sort((a, b) => (a.location || "").localeCompare(b.location || ""));
@@ -306,6 +386,13 @@ export default function App() {
   }, [items, query, filter, sort]);
 
   async function upsertItem(partial) {
+  const isCheckedOnlyUpdate =
+    "checked" in partial &&
+    Object.keys(partial).every((k) => k === "id" || k === "checked");
+  if (!isAdmin && !isCheckedOnlyUpdate) {
+    setToast("Only admin can edit item details.");
+    return;
+  }
   const id = partial.id;
   if (typeof id === "string" && id.startsWith("tmp_")) {
     setToast("Syncing item, please try again.");
@@ -342,6 +429,10 @@ export default function App() {
 
   async function addItem(e) {
     e.preventDefault();
+    if (!isAdmin) {
+      setToast("Only admin can add items.");
+      return;
+    }
     const formEl = e.currentTarget;
     if (!(formEl instanceof HTMLFormElement)) {
       const msg = "Add form not found. Please reload.";
@@ -423,6 +514,7 @@ export default function App() {
       setSort("recent");
       setAddError("");
       setAddDebug("Added.");
+      setShowAddDialog(false);
       setToast("Added");
     } catch (err) {
       const msg = `Unhandled add error: ${err instanceof Error ? err.message : String(err)}`;
@@ -436,6 +528,10 @@ export default function App() {
 
 
   async function removeItem(id) {
+  if (!isAdmin) {
+    setToast("Only admin can delete items.");
+    return;
+  }
   const { error } = await supabase.from("inventory_items").delete().eq("id", id);
   if (error) {
     setToast("Delete error: " + error.message);
@@ -538,6 +634,48 @@ export default function App() {
     reader.readAsText(file);
   }
 
+  function addConsumable(e) {
+    e.preventDefault();
+    if (!isAdmin) {
+      setToast("you don't have priviledge, please contact admin");
+      return;
+    }
+    const fd = new FormData(e.currentTarget);
+    const name = String(fd.get("name") || "").trim();
+    if (!name) return;
+    const category = String(fd.get("category") || "").trim();
+    const unit = String(fd.get("unit") || "").trim() || "pcs";
+    const location = String(fd.get("location") || "").trim() || CONSUMABLE_LOCATIONS[0];
+    const onHand = Number(fd.get("onHand") || 0) || 0;
+    const minLevel = Number(fd.get("minLevel") || 0) || 0;
+
+    setConsumables((prev) => [
+      { id: uid(), name, category, unit, location, onHand, minLevel, updatedAt: Date.now() },
+      ...prev,
+    ]);
+    e.currentTarget.reset();
+    setToast("Consumable added");
+  }
+
+  function adjustConsumable(id, delta) {
+    setConsumables((prev) =>
+      prev.map((c) =>
+        c.id === id
+          ? { ...c, onHand: Math.max(0, Number(c.onHand || 0) + delta), updatedAt: Date.now() }
+          : c
+      )
+    );
+  }
+
+  function removeConsumable(id) {
+    if (!isAdmin) {
+      setToast("you don't have priviledge, please contact admin");
+      return;
+    }
+    setConsumables((prev) => prev.filter((c) => c.id !== id));
+    setToast("Consumable removed");
+  }
+
   async function onSignup(nameRaw, usernameRaw, password) {
     const name = normalizeDisplayName(nameRaw);
     const username = normalizeUsername(usernameRaw);
@@ -592,6 +730,7 @@ export default function App() {
       normalizeDisplayName(data?.user?.user_metadata?.name);
     setCurrentUser(u);
     setCurrentName(name || u);
+    setIsAdmin(isAdminIdentity(data?.user, u));
     setAuthIdentity({
       id: data?.user?.id || "",
       email: data?.user?.email || "",
@@ -604,6 +743,8 @@ export default function App() {
     await supabase.auth.signOut();
     setCurrentUser("");
     setCurrentName("");
+    setIsAdmin(false);
+    setShowAddDialog(false);
     setAuthIdentity({ id: "", email: "" });
     setItems([]);
     setQuery("");
@@ -624,6 +765,7 @@ export default function App() {
         normalizeDisplayName(s.user.user_metadata?.name);
       setCurrentUser(u);
       setCurrentName(name || u);
+      setIsAdmin(isAdminIdentity(s.user, u));
       setAuthIdentity({
         id: s.user.id || "",
         email: s.user.email || "",
@@ -638,6 +780,7 @@ export default function App() {
         normalizeDisplayName(session?.user?.user_metadata?.name);
       setCurrentUser(u);
       setCurrentName(name || u);
+      setIsAdmin(isAdminIdentity(session?.user, u));
       setAuthIdentity({
         id: session?.user?.id || "",
         email: session?.user?.email || "",
@@ -649,146 +792,266 @@ export default function App() {
   }, []);
 
   if (!currentUser) {
-    return <AuthScreen toast={authToast} onSignup={onSignup} onLogin={onLogin} />;
+    return (
+      <AuthScreen
+        toast={authToast}
+        onSignup={onSignup}
+        onLogin={onLogin}
+        theme={theme}
+        onToggleTheme={() => setTheme((t) => (t === "dark" ? "light" : "dark"))}
+      />
+    );
   }
 
   return (
     <div style={styles.page}>
+      <div style={styles.gridMesh} />
       <div style={{ ...styles.blob, ...styles.blobA }} />
       <div style={{ ...styles.blob, ...styles.blobB }} />
       <div style={{ ...styles.blob, ...styles.blobC }} />
       
 
       <div style={styles.container}>
-        <header style={styles.header}>
+        <header style={styles.header} className="fade-up">
           <div>
-            <div style={styles.kicker}>Inventory Check</div>
-            <h1 style={styles.h1}>Vibe Inventory</h1>
+            <div style={styles.kicker}>Operations Workspace</div>
+            <h1 style={styles.h1}>Inventory Workspace</h1>
             <div style={styles.sub}>
-              Welcome <b>{currentName || currentUser}</b>
+              Signed in as <b>{currentName || currentUser}</b>
+              <span style={{ ...styles.rolePill, ...(isAdmin ? styles.roleAdmin : styles.roleUser) }}>
+                {isAdmin ? "Admin" : "User"}
+              </span>
               <button onClick={onLogout} style={{ ...styles.btnMini, marginLeft: 10 }}>
                 Logout
+              </button>
+              <button
+                onClick={() => setTheme((t) => (t === "dark" ? "light" : "dark"))}
+                style={{ ...styles.btnMini, ...styles.btnMiniGhost, marginLeft: 8 }}
+              >
+                {theme === "dark" ? "Light mode" : "Dark mode"}
               </button>
             </div>
           </div>
 
           <div style={styles.statsRow}>
-            <Stat label="Total" value={stats.total} />
-            <Stat label="Checked" value={stats.checked} />
-            <Stat label="Missing" value={stats.missing} />
+            <Stat label="Consumables" value={consumableStats.total} />
+            <Stat label="Cons Low" value={consumableStats.low} />
+            <Stat label="Healthy" value={consumableStats.healthy} />
           </div>
         </header>
 
-        <div style={styles.grid}>
-          <section style={styles.card}>
-            <div style={styles.cardTitle}>Add item</div>
-            <form onSubmit={addItem} style={styles.form}>
-              <Input name="name" placeholder="Item name (required)" required />
-              <div style={styles.row2}>
-                <Input name="tag" placeholder="Tag (e.g. AUD-RF-014)" />
-                <Input name="location" placeholder="Location" />
-              </div>
-              <div style={styles.row2}>
-                <Input name="qty" type="number" placeholder="Qty" defaultValue={1} min={1} />
-                <Input name="note" placeholder="Note" />
-              </div>
-
-              <button type="submit" disabled={isAdding} style={{ ...styles.btn, ...styles.btnPrimary, opacity: isAdding ? 0.7 : 1 }}>
-                {isAdding ? "Adding..." : "+ Add"}
-              </button>
-              {addError ? <div style={{ fontSize: 12, color: "#ff9db8" }}>{addError}</div> : null}
-              {addDebug ? <div style={{ fontSize: 12, opacity: 0.85 }}>{addDebug}</div> : null}
-            </form>
-
-            <div style={styles.divider} />
-
-            <div style={styles.cardTitle}>Stocktake controls</div>
-            <div style={styles.controls}>
-              <button onClick={markAllChecked} style={styles.btn}>
-                Mark all checked
-              </button>
-              <button onClick={resetChecks} style={styles.btn}>
-                Reset checks
-              </button>
-              <button onClick={exportJson} style={styles.btn}>
-                Export JSON
-              </button>
-
-              <input
-                ref={fileRef}
-                type="file"
-                accept="application/json"
-                style={{ display: "none" }}
-                onChange={(e) => {
-                  const f = e.target.files?.[0];
-                  if (f) importJson(f);
-                  e.target.value = "";
-                }}
-              />
-              <button
-                onClick={() => fileRef.current?.click()}
-                style={{ ...styles.btn, ...styles.btnGhost }}
-              >
-                Import JSON
-              </button>
-            </div>
-
-           
-          </section>
-
-          <section style={{ ...styles.card, ...styles.cardTall }}>
-            <div style={styles.listTop}>
-              <div style={styles.cardTitle}>Items</div>
-
-              <div style={styles.listControls}>
-                <input
-                  value={query}
-                  onChange={(e) => setQuery(e.target.value)}
-                  placeholder="Search name, tag, location…"
-                  style={styles.search}
-                />
-
-                <select value={filter} onChange={(e) => setFilter(e.target.value)} style={styles.select}>
-                  <option value="all">All</option>
-                  <option value="checked">Checked</option>
-                  <option value="missing">Missing</option>
-                </select>
-
-                <select value={sort} onChange={(e) => setSort(e.target.value)} style={styles.select}>
-                  <option value="recent">Recent</option>
-                  <option value="name">Name</option>
-                  <option value="location">Location</option>
-                </select>
-              </div>
-            </div>
-
-            <div style={styles.list}>
-              {filtered.length === 0 ? (
-                <div style={styles.empty}>No items match.</div>
-              ) : (
-                filtered.map((it) => (
-                  <ItemRow
-                    key={it.id}
-                    item={it}
-                    onToggle={() => upsertItem({ id: it.id, checked: !it.checked })}
-                    onEdit={(patch) => upsertItem({ id: it.id, ...patch })}
-                    onDelete={() => removeItem(it.id)}
-                  />
-                ))
-              )}
-            </div>
-          </section>
+        <div style={styles.pageTabs}>
+          <button
+            onClick={() => setActivePage("overview")}
+            style={{ ...styles.tabBtn, ...(activePage === "overview" ? styles.tabBtnActive : {}) }}
+          >
+            Overview
+          </button>
+          <button
+            onClick={() => {
+              if (!isAdmin) {
+                setToast("Coming soon");
+                return;
+              }
+              setActivePage("equipment");
+            }}
+            style={{
+              ...styles.tabBtn,
+              ...(activePage === "equipment" && isAdmin ? styles.tabBtnActive : {}),
+              ...(!isAdmin ? styles.tabBtnDisabled : {}),
+            }}
+          >
+            Equipment
+          </button>
+          <button
+            onClick={() => setActivePage("consumables")}
+            style={{ ...styles.tabBtn, ...(activePage === "consumables" ? styles.tabBtnActive : {}) }}
+          >
+            Consumables
+          </button>
         </div>
 
+        {activePage === "overview" ? (
+          <OverviewPage consumableStats={consumableStats} consumables={consumables} />
+        ) : null}
+
+        {activePage === "equipment" && isAdmin ? (
+          <div style={styles.grid}>
+            <section style={styles.card} className="fade-up">
+              <div style={styles.cardTitle}>Workspace controls</div>
+              <button
+                onClick={() => {
+                  if (!isAdmin) {
+                    setToast("you don't have priviledge, please contact admin");
+                    return;
+                  }
+                  setAddError("");
+                  setAddDebug("");
+                  setShowAddDialog(true);
+                }}
+                style={{ ...styles.btn, ...styles.btnPrimary }}
+              >
+                Add Item
+              </button>
+
+              <div style={styles.divider} />
+
+              <div style={styles.cardTitle}>Stocktake controls</div>
+              <div style={styles.controls}>
+                <button onClick={markAllChecked} style={styles.btn}>
+                  Mark all checked
+                </button>
+                <button onClick={resetChecks} style={styles.btn}>
+                  Reset checks
+                </button>
+                {isAdmin ? (
+                  <>
+                    <button onClick={exportJson} style={styles.btn}>
+                      Export JSON
+                    </button>
+
+                    <input
+                      ref={fileRef}
+                      type="file"
+                      accept="application/json"
+                      style={{ display: "none" }}
+                      onChange={(e) => {
+                        const f = e.target.files?.[0];
+                        if (f) importJson(f);
+                        e.target.value = "";
+                      }}
+                    />
+                    <button
+                      onClick={() => fileRef.current?.click()}
+                      style={{ ...styles.btn, ...styles.btnGhost }}
+                    >
+                      Import JSON
+                    </button>
+                  </>
+                ) : null}
+              </div>
+              {!isAdmin ? (
+                <div style={{ ...styles.restrictedBox, marginTop: 10 }}>
+                  Add/delete/edit permissions are restricted to admin users. You can still check and uncheck items.
+                </div>
+              ) : null}
+            </section>
+
+            <section style={{ ...styles.card, ...styles.cardTall, animationDelay: "90ms" }} className="fade-up">
+              <div style={styles.listTop}>
+                <div style={styles.cardTitle}>Inventory items</div>
+
+                <div style={styles.listControls}>
+                  <input
+                    value={query}
+                    onChange={(e) => setQuery(e.target.value)}
+                    placeholder="Search name, tag, location…"
+                    style={styles.search}
+                  />
+
+                  <select value={filter} onChange={(e) => setFilter(e.target.value)} style={styles.select}>
+                    <option value="all">All</option>
+                    <option value="checked">Checked</option>
+                    <option value="missing">Missing</option>
+                  </select>
+
+                  <select value={sort} onChange={(e) => setSort(e.target.value)} style={styles.select}>
+                    <option value="recent">Recent</option>
+                    <option value="unsorted">Unsorted</option>
+                    <option value="name">Name</option>
+                    <option value="location">Location</option>
+                  </select>
+                </div>
+              </div>
+
+              <div style={styles.list}>
+                {filtered.length === 0 ? (
+                  <div style={styles.empty}>No items match.</div>
+                ) : (
+                  filtered.map((it) => (
+                    <ItemRow
+                      key={it.id}
+                      item={it}
+                      onToggle={() => upsertItem({ id: it.id, checked: !it.checked })}
+                      onEdit={(patch) => upsertItem({ id: it.id, ...patch })}
+                      onDelete={() => removeItem(it.id)}
+                      canManage={isAdmin}
+                    />
+                  ))
+                )}
+              </div>
+            </section>
+          </div>
+        ) : null}
+
+        {activePage === "consumables" ? (
+          <ConsumablesPage
+            consumables={consumables}
+            isAdmin={isAdmin}
+            onAdd={addConsumable}
+            onAdjust={adjustConsumable}
+            onDelete={removeConsumable}
+            onNoPrivilege={() => setToast("you don't have priviledge, please contact admin")}
+          />
+        ) : null}
+
+        {showAddDialog && isAdmin ? (
+          <div style={styles.modalBackdrop} onClick={() => setShowAddDialog(false)}>
+            <div style={styles.modalCard} onClick={(e) => e.stopPropagation()}>
+              <div style={styles.modalHeader}>
+                <div style={styles.modalTitle}>Add item</div>
+                <button
+                  type="button"
+                  onClick={() => setShowAddDialog(false)}
+                  style={{ ...styles.btnMini, ...styles.btnMiniGhost }}
+                >
+                  Close
+                </button>
+              </div>
+
+              <form onSubmit={addItem} style={styles.form}>
+                <Input name="name" placeholder="Item name (required)" required />
+                <div style={styles.row2}>
+                  <Input name="tag" placeholder="Tag (e.g. AUD-RF-014)" />
+                  <Input name="location" placeholder="Location" />
+                </div>
+                <div style={styles.row2}>
+                  <Input name="qty" type="number" placeholder="Qty" defaultValue={1} min={1} />
+                  <Input name="note" placeholder="Note" />
+                </div>
+
+                <div style={styles.modalActions}>
+                  <button
+                    type="submit"
+                    disabled={isAdding}
+                    style={{ ...styles.btn, ...styles.btnPrimary, opacity: isAdding ? 0.7 : 1 }}
+                  >
+                    {isAdding ? "Adding..." : "Add item"}
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setShowAddDialog(false)}
+                    style={{ ...styles.btn, ...styles.btnGhost }}
+                  >
+                    Cancel
+                  </button>
+                </div>
+                {addError ? <div style={{ fontSize: 12, color: "#fca5a5" }}>{addError}</div> : null}
+                {addDebug ? <div style={{ fontSize: 12, opacity: 0.85 }}>{addDebug}</div> : null}
+              </form>
+            </div>
+          </div>
+        ) : null}
+
         {toast ? <div style={styles.toast}>{toast}</div> : null}
-        <footer style={styles.footer}>Next vibes: barcode scan, audit log, multi-device sync.</footer>
+        <footer style={styles.footer}>Built by Chris Mulia.</footer>
       </div>
     </div>
   );
 }
 
 
-function AuthScreen({ toast, onSignup, onLogin }) {
+function AuthScreen({ toast, onSignup, onLogin, theme, onToggleTheme }) {
   const [mode, setMode] = useState("login"); // login | signup
   const [name, setName] = useState("");
   const [username, setUsername] = useState("");
@@ -796,20 +1059,24 @@ function AuthScreen({ toast, onSignup, onLogin }) {
 
   return (
     <div style={styles.page}>
+      <div style={styles.gridMesh} />
       <div style={{ ...styles.blob, ...styles.blobA }} />
       <div style={{ ...styles.blob, ...styles.blobB }} />
       <div style={{ ...styles.blob, ...styles.blobC }} />
 
       <div style={styles.container}>
-        <header style={styles.header}>
+        <header style={styles.header} className="fade-up">
           <div>
-            <div style={styles.kicker}>Inventory Check</div>
-            <h1 style={styles.h1}>Vibe Stocktake</h1>
-            <div style={styles.sub}>Login is stored in Supabase Database.</div>
+            <div style={styles.kicker}>OpenAI-inspired Console</div>
+            <h1 style={styles.h1}>Inventory Workspace</h1>
+            <div style={styles.sub}>Secure auth with Supabase.</div>
           </div>
+          <button onClick={onToggleTheme} style={{ ...styles.btnMini, ...styles.btnMiniGhost }}>
+            {theme === "dark" ? "Light mode" : "Dark mode"}
+          </button>
         </header>
 
-        <section style={{ ...styles.card, maxWidth: 520 }}>
+        <section style={{ ...styles.card, maxWidth: 520 }} className="fade-up">
           <div style={styles.cardTitle}>{mode === "login" ? "Login" : "Sign up"}</div>
 
           <div style={styles.form}>
@@ -860,6 +1127,201 @@ function AuthScreen({ toast, onSignup, onLogin }) {
   );
 }
 
+function OverviewPage({ consumableStats, consumables }) {
+  const recentConsumables = [...consumables].sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0)).slice(0, 5);
+  const lowRows = consumables
+    .filter((c) => Number(c.onHand || 0) <= Number(c.minLevel || 0))
+    .slice(0, 5);
+
+  return (
+    <div style={{ ...styles.grid, gridTemplateColumns: "repeat(auto-fit, minmax(280px, 1fr))" }}>
+      <section style={styles.card} className="fade-up">
+        <div style={styles.cardTitle}>Consumables snapshot</div>
+        <div style={styles.overviewStatStack}>
+          <div style={styles.overviewStatRow}><span>Total SKUs</span><b>{consumableStats.total}</b></div>
+          <div style={styles.overviewStatRow}><span>Low stock</span><b>{consumableStats.low}</b></div>
+          <div style={styles.overviewStatRow}><span>Healthy</span><b>{consumableStats.healthy}</b></div>
+        </div>
+      </section>
+
+      <section style={{ ...styles.card, ...styles.cardTall }} className="fade-up">
+        <div style={styles.cardTitle}>Recent consumables activity</div>
+        <div style={styles.list}>
+          {recentConsumables.length ? recentConsumables.map((c) => (
+            <div key={c.id} style={styles.overviewRow}>
+              <div style={styles.overviewMainText}>{c.name}</div>
+              <div style={styles.overviewSubText}>{c.onHand} {c.unit || "pcs"} on hand · {fmtTime(c.updatedAt)}</div>
+            </div>
+          )) : <div style={styles.empty}>No recent activity.</div>}
+        </div>
+      </section>
+
+      <section style={{ ...styles.card, ...styles.cardTall, ...styles.lowStockCard }} className="fade-up">
+        <div style={styles.cardTitle}>Low-stock alert</div>
+        <div style={styles.list}>
+          {lowRows.length ? lowRows.map((c) => (
+            <div key={c.id} style={{ ...styles.overviewRow, ...styles.lowStockRow }}>
+              <div style={styles.overviewMainText}>{c.name}</div>
+              <div style={styles.overviewSubText}>
+                {c.onHand} {c.unit} left (min {c.minLevel}) · {c.location || "Unassigned"}
+              </div>
+            </div>
+          )) : <div style={styles.empty}>No low-stock consumables.</div>}
+        </div>
+      </section>
+    </div>
+  );
+}
+
+function ConsumablesPage({ consumables, isAdmin, onAdd, onAdjust, onDelete, onNoPrivilege }) {
+  const [locationFilter, setLocationFilter] = useState("");
+  const [showAddConsumable, setShowAddConsumable] = useState(false);
+
+  function consumableEmoji(row) {
+    const text = `${row.name || ""} ${row.category || ""}`.toLowerCase();
+    if (text.includes("battery") || text.includes("power")) return "🔋";
+    if (text.includes("tape")) return "🟨";
+    if (text.includes("label")) return "🏷️";
+    if (text.includes("clean")) return "🧴";
+    if (text.includes("glove")) return "🧤";
+    if (text.includes("paper")) return "📄";
+    if (text.includes("cable")) return "🔌";
+    return "📦";
+  }
+
+  const filteredConsumables = locationFilter
+    ? consumables.filter((c) => String(c.location || "") === locationFilter)
+    : [];
+
+  function openAddConsumable() {
+    if (!isAdmin) {
+      onNoPrivilege?.();
+      return;
+    }
+    setShowAddConsumable(true);
+  }
+
+  function submitAddConsumable(e) {
+    onAdd(e);
+    setShowAddConsumable(false);
+  }
+
+  return (
+    <div style={styles.fullWidthStack}>
+      <section style={styles.card} className="fade-up">
+        <div style={styles.listTop}>
+          <div style={styles.cardTitle}>Consumables gallery</div>
+          <div style={styles.listControls}>
+            <div style={styles.locationButtonRow}>
+              <div style={styles.locationStarter}>
+                {locationFilter || "Choose a location"}
+              </div>
+              {CONSUMABLE_LOCATIONS.map((loc) => (
+                <button
+                  key={loc}
+                  onClick={() => setLocationFilter(loc)}
+                  style={{ ...styles.locationBtn, ...(locationFilter === loc ? styles.locationBtnActive : {}) }}
+                >
+                  {loc}
+                </button>
+              ))}
+            </div>
+            <button onClick={openAddConsumable} style={{ ...styles.plusBtn, ...(isAdmin ? {} : styles.plusBtnLocked) }}>
+              +
+            </button>
+          </div>
+        </div>
+
+        {filteredConsumables.length === 0 ? (
+          <div style={styles.empty}>
+            {locationFilter ? "No consumables in this location yet." : "Choose a location to view consumables."}
+          </div>
+        ) : (
+          <div style={styles.consumableGallery} className="consumable-gallery">
+            {filteredConsumables.map((c) => {
+              const low = Number(c.onHand || 0) <= Number(c.minLevel || 0);
+              return (
+                <article key={c.id} style={styles.consumableCard}>
+                  <div style={styles.consumableEmoji}>{consumableEmoji(c)}</div>
+                  <div style={styles.consumableName}>{c.name}</div>
+                  <div style={styles.consumableMeta}>
+                    {c.category || "General"} · {c.unit || "pcs"} · {c.location || "Unassigned"}
+                  </div>
+                  <div style={{ ...styles.pill, ...(low ? styles.pillWarn : styles.pillOk) }}>
+                    {low ? `Low (min ${c.minLevel})` : "Healthy"}
+                  </div>
+                  <div style={styles.consumableCount}>
+                    {c.onHand} {c.unit || "pcs"}
+                  </div>
+                  <div style={styles.consumableActions}>
+                    <button onClick={() => onAdjust(c.id, -1)} style={{ ...styles.qtyBtn, ...styles.qtyMinus }}>
+                      −
+                    </button>
+                    <button onClick={() => onAdjust(c.id, +1)} style={{ ...styles.qtyBtn, ...styles.qtyPlus }}>
+                      +
+                    </button>
+                  </div>
+                  {isAdmin ? (
+                    <button onClick={() => onDelete(c.id)} style={{ ...styles.btnMini, ...styles.btnMiniDanger, width: "100%" }}>
+                      Delete
+                    </button>
+                  ) : null}
+                </article>
+              );
+            })}
+          </div>
+        )}
+      </section>
+
+      {showAddConsumable ? (
+        <div style={styles.modalBackdrop} onClick={() => setShowAddConsumable(false)}>
+          <div style={styles.modalCard} onClick={(e) => e.stopPropagation()}>
+            <div style={styles.modalHeader}>
+              <div style={styles.modalTitle}>Add consumable</div>
+              <button
+                type="button"
+                onClick={() => setShowAddConsumable(false)}
+                style={{ ...styles.btnMini, ...styles.btnMiniGhost }}
+              >
+                Close
+              </button>
+            </div>
+            <form onSubmit={submitAddConsumable} style={styles.form}>
+              <Input name="name" placeholder="Name (required)" required />
+              <div style={styles.row2}>
+                <Input name="category" placeholder="Category" />
+                <Input name="unit" placeholder="Unit" />
+              </div>
+              <div style={styles.row2}>
+                <select name="location" defaultValue={CONSUMABLE_LOCATIONS[0]} style={styles.select}>
+                  {CONSUMABLE_LOCATIONS.map((loc) => (
+                    <option key={loc} value={loc}>{loc}</option>
+                  ))}
+                </select>
+                <Input name="onHand" type="number" placeholder="On hand" defaultValue={0} min={0} />
+              </div>
+              <div style={styles.row2}>
+                <Input name="minLevel" type="number" placeholder="Min level" defaultValue={0} min={0} />
+                <div />
+              </div>
+              <div style={styles.modalActions}>
+                <button type="submit" style={{ ...styles.btn, ...styles.btnPrimary }}>Add consumable</button>
+                <button
+                  type="button"
+                  onClick={() => setShowAddConsumable(false)}
+                  style={{ ...styles.btn, ...styles.btnGhost }}
+                >
+                  Cancel
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
 function Stat({ label, value }) {
   return (
     <div style={styles.stat}>
@@ -873,7 +1335,7 @@ function Input(props) {
   return <input {...props} style={styles.input} />;
 }
 
-function ItemRow({ item, onToggle, onEdit, onDelete }) {
+function ItemRow({ item, onToggle, onEdit, onDelete, canManage }) {
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState({
     name: item.name,
@@ -964,36 +1426,42 @@ function ItemRow({ item, onToggle, onEdit, onDelete }) {
       </div>
 
       <div style={styles.actions}>
-        {!editing ? (
-          <button onClick={() => setEditing(true)} style={{ ...styles.btnMini, ...styles.btnMiniGhost }}>
-            Edit
-          </button>
-        ) : (
+        {canManage ? (
           <>
-            <button
-              onClick={() => {
-                onEdit({
-                  name: String(draft.name || "").trim() || "Untitled",
-                  tag: String(draft.tag || "").trim(),
-                  location: String(draft.location || "").trim(),
-                  qty: Number(draft.qty || 1) || 1,
-                  note: String(draft.note || "").trim(),
-                });
-                setEditing(false);
-              }}
-              style={{ ...styles.btnMini, ...styles.btnMiniPrimary }}
-            >
-              Save
-            </button>
-            <button onClick={() => setEditing(false)} style={{ ...styles.btnMini, ...styles.btnMiniGhost }}>
-              Cancel
+            {!editing ? (
+              <button onClick={() => setEditing(true)} style={{ ...styles.btnMini, ...styles.btnMiniGhost }}>
+                Edit
+              </button>
+            ) : (
+              <>
+                <button
+                  onClick={() => {
+                    onEdit({
+                      name: String(draft.name || "").trim() || "Untitled",
+                      tag: String(draft.tag || "").trim(),
+                      location: String(draft.location || "").trim(),
+                      qty: Number(draft.qty || 1) || 1,
+                      note: String(draft.note || "").trim(),
+                    });
+                    setEditing(false);
+                  }}
+                  style={{ ...styles.btnMini, ...styles.btnMiniPrimary }}
+                >
+                  Save
+                </button>
+                <button onClick={() => setEditing(false)} style={{ ...styles.btnMini, ...styles.btnMiniGhost }}>
+                  Cancel
+                </button>
+              </>
+            )}
+
+            <button onClick={onDelete} style={{ ...styles.btnMini, ...styles.btnMiniDanger }}>
+              Delete
             </button>
           </>
+        ) : (
+          <div style={styles.readOnlyHint}>Check/uncheck only</div>
         )}
-
-        <button onClick={onDelete} style={{ ...styles.btnMini, ...styles.btnMiniDanger }}>
-          Delete
-        </button>
       </div>
     </div>
   );
@@ -1002,119 +1470,264 @@ function ItemRow({ item, onToggle, onEdit, onDelete }) {
 const styles = {
   page: {
     minHeight: "100vh",
-    color: "rgba(255,255,255,0.92)",
-    background:
-      "radial-gradient(1200px 800px at 20% 20%, rgba(226, 245, 11, 0.35), transparent 60%), radial-gradient(900px 700px at 80% 40%, rgba(255, 140, 0, 0.22), transparent 60%), radial-gradient(800px 600px at 40% 90%, rgba(255,80,170,0.18), transparent 60%), linear-gradient(180deg, #0b0f1a 0%, #070913 100%)",
+    color: "var(--text-primary)",
+    background: "var(--page-bg)",
     position: "relative",
-    overflow: "hidden",
     overflowX: "hidden",
     fontFamily:
-      'ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, "Apple Color Emoji","Segoe UI Emoji"',
+      '"Sora", "Manrope", "Avenir Next", "Segoe UI", "Helvetica Neue", sans-serif',
   },
 
-  blob: { position: "absolute", filter: "blur(28px)", opacity: 0.55, borderRadius: "999px" },
+  gridMesh: {
+    position: "absolute",
+    inset: 0,
+    backgroundImage:
+      "linear-gradient(var(--mesh-line) 1px, transparent 1px), linear-gradient(90deg, var(--mesh-line) 1px, transparent 1px)",
+    backgroundSize: "44px 44px",
+    maskImage: "radial-gradient(ellipse at center, black 50%, transparent 95%)",
+    pointerEvents: "none",
+    opacity: 0.28,
+  },
+  blob: { position: "absolute", filter: "blur(56px)", opacity: 0.52, borderRadius: "999px", pointerEvents: "none" },
   blobA: {
-    width: 520,
-    height: 520,
-    left: -180,
-    top: -160,
-    background: "radial-gradient(circle at 30% 30%, rgba(120,119,198,1), rgba(120,119,198,0) 62%)",
+    width: 600,
+    height: 600,
+    left: -220,
+    top: -240,
+    background: "radial-gradient(circle at 30% 30%, rgba(20, 184, 166, 0.95), rgba(20, 184, 166, 0) 64%)",
   },
   blobB: {
     width: 460,
     height: 460,
     right: -160,
-    top: 120,
-    background: "radial-gradient(circle at 30% 30%, rgb(255, 0, 0), rgba(0,205,255,0) 62%)",
+    top: 80,
+    background: "radial-gradient(circle at 30% 30%, rgba(34, 197, 94, 0.85), rgba(34, 197, 94, 0) 64%)",
   },
   blobC: {
-    width: 560,
-    height: 560,
-    left: 260,
-    bottom: -280,
-    background: "radial-gradient(circle at 30% 30%, rgb(255, 182, 80), rgba(255,80,170,0) 62%)",
+    width: 520,
+    height: 520,
+    left: 220,
+    bottom: -300,
+    background: "radial-gradient(circle at 30% 30%, rgba(56, 189, 248, 0.78), rgba(56, 189, 248, 0) 64%)",
   },
 
   container: {
-  maxWidth: "1400px",
-  margin: "0 auto",
-  padding: "clamp(16px, 3vw, 40px)",
-},
+    maxWidth: 1220,
+    margin: "0 auto",
+    padding: "clamp(18px, 4vw, 44px)",
+    position: "relative",
+    zIndex: 1,
+  },
   header: {
     display: "flex",
-    gap: 18,
+    gap: 20,
     alignItems: "flex-end",
     justifyContent: "space-between",
     flexWrap: "wrap",
-    marginBottom: 18,
+    marginBottom: 20,
   },
-  kicker: { fontSize: 12, letterSpacing: 1.4, textTransform: "uppercase", opacity: 0.8 },
+  kicker: {
+    fontSize: 11,
+    letterSpacing: 1.9,
+    textTransform: "uppercase",
+    opacity: 0.82,
+    color: "var(--text-muted)",
+  },
   h1: {
-  fontSize: "clamp(22px, 4vw, 36px)",
-  margin: "6px 0 6px",
-  lineHeight: 1.1,
-},
-  sub: { opacity: 0.82, maxWidth: 520 },
+    fontSize: "clamp(28px, 5.2vw, 52px)",
+    letterSpacing: "-0.03em",
+    margin: "8px 0 8px",
+    lineHeight: 0.98,
+    fontWeight: 650,
+  },
+  sub: {
+    opacity: 0.9,
+    maxWidth: 620,
+    color: "var(--text-soft)",
+    fontSize: "clamp(13px, 2vw, 15px)",
+  },
+  rolePill: {
+    display: "inline-block",
+    marginLeft: 10,
+    padding: "3px 10px",
+    borderRadius: 999,
+    fontSize: 11,
+    letterSpacing: 0.8,
+    textTransform: "uppercase",
+    fontWeight: 700,
+    border: "1px solid var(--field-border)",
+  },
+  roleAdmin: {
+    color: "#d1fae5",
+    background: "rgba(6, 95, 70, 0.38)",
+    borderColor: "rgba(16, 185, 129, 0.55)",
+  },
+  roleUser: {
+    color: "#dbeafe",
+    background: "rgba(30, 64, 175, 0.26)",
+    borderColor: "rgba(59, 130, 246, 0.42)",
+  },
 
   statsRow: { display: "flex", gap: 10, flexWrap: "wrap" },
   stat: {
-    padding: "10px 12px",
-    borderRadius: 16,
-    background: "rgba(255,255,255,0.07)",
-    border: "1px solid rgba(255,255,255,0.10)",
-    backdropFilter: "blur(10px)",
-    minWidth: 110,
+    padding: "10px 14px",
+    borderRadius: 14,
+    background: "var(--panel-bg)",
+    border: "1px solid var(--panel-border)",
+    boxShadow: "inset 0 1px 0 rgba(255,255,255,0.04)",
+    minWidth: 118,
   },
-  statLabel: { fontSize: 12, opacity: 0.75 },
-  statValue: { fontSize: 20, fontWeight: 700 },
+  statLabel: { fontSize: 11.5, opacity: 0.75, textTransform: "uppercase", letterSpacing: 0.8 },
+  statValue: { fontSize: 22, fontWeight: 700 },
+  pageTabs: {
+    display: "flex",
+    gap: 8,
+    flexWrap: "wrap",
+    marginBottom: 14,
+  },
+  tabBtn: {
+    padding: "8px 12px",
+    borderRadius: 999,
+    border: "1px solid var(--tab-border)",
+    background: "var(--tab-bg)",
+    color: "var(--tab-text)",
+    fontWeight: 600,
+    letterSpacing: 0.2,
+    cursor: "pointer",
+  },
+  tabBtnDisabled: {
+    opacity: 0.56,
+    filter: "grayscale(0.45)",
+    cursor: "not-allowed",
+  },
+  locationButtonRow: {
+    display: "flex",
+    flexWrap: "wrap",
+    gap: 8,
+  },
+  locationStarter: {
+    minHeight: 50,
+    padding: "12px 16px",
+    borderRadius: 12,
+    border: "1px dashed var(--dash-border)",
+    background: "var(--ghost-bg)",
+    color: "var(--text-muted)",
+    display: "grid",
+    placeItems: "center",
+    fontWeight: 700,
+  },
+  locationBtn: {
+    minHeight: 50,
+    padding: "12px 18px",
+    borderRadius: 12,
+    border: "1px solid var(--field-border)",
+    background: "var(--field-bg)",
+    color: "var(--text-primary)",
+    fontWeight: 700,
+    cursor: "pointer",
+  },
+  locationBtnActive: {
+    border: "1px solid var(--accent-border)",
+    background: "var(--accent-bg)",
+    color: "var(--tab-active-text)",
+    boxShadow: "var(--accent-shadow)",
+  },
+  plusBtn: {
+    width: 52,
+    height: 52,
+    borderRadius: 999,
+    border: "1px solid var(--accent-border)",
+    background: "var(--accent-bg)",
+    color: "var(--tab-active-text)",
+    cursor: "pointer",
+    fontSize: 34,
+    lineHeight: 1,
+    fontWeight: 700,
+    display: "grid",
+    placeItems: "center",
+    boxShadow: "var(--accent-shadow)",
+  },
+  plusBtnLocked: {
+    opacity: 0.65,
+    filter: "grayscale(0.25)",
+  },
+  tabBtnActive: {
+    border: "1px solid var(--tab-active-border)",
+    background: "var(--tab-active-bg)",
+    color: "var(--tab-active-text)",
+  },
 
   grid: {
-  display: "grid",
-  gridTemplateColumns: "repeat(auto-fit, minmax(320px, 1fr))",
-  gap: "clamp(12px, 2vw, 20px)",
-},
+    display: "grid",
+    gridTemplateColumns: "repeat(auto-fit, minmax(320px, 1fr))",
+    gap: "clamp(12px, 2.2vw, 24px)",
+  },
+  fullWidthStack: {
+    display: "flex",
+    flexDirection: "column",
+    gap: 12,
+  },
   card: {
-    borderRadius: 22,
-    background: "rgba(255,255,255,0.07)",
-    border: "1px solid rgba(255,255,255,0.10)",
-    boxShadow: "0 16px 40px rgba(0,0,0,0.35)",
-    backdropFilter: "blur(12px)",
-    padding: 16,
+    borderRadius: 20,
+    background: "var(--card-bg)",
+    border: "1px solid var(--card-border)",
+    boxShadow: "var(--shadow-elev)",
+    backdropFilter: "blur(18px)",
+    padding: 18,
   },
   cardTall: {
-  minHeight: "min(540px, 80vh)",
-},
+    minHeight: 0,
+  },
 
-  cardTitle: { fontSize: 14, letterSpacing: 0.3, opacity: 0.85, marginBottom: 10 },
+  cardTitle: {
+    fontSize: 12,
+    letterSpacing: 1.2,
+    textTransform: "uppercase",
+    color: "var(--text-muted)",
+    marginBottom: 10,
+    fontWeight: 600,
+  },
 
   form: { display: "flex", flexDirection: "column", gap: 10 },
-  row2: { display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 },
+  row2: { display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(140px, 1fr))", gap: 10 },
   input: {
     padding: "12px 12px",
-    borderRadius: 16,
-    border: "1px solid rgba(255,255,255,0.12)",
-    background: "rgba(0,0,0,0.20)",
-    color: "rgba(255,255,255,0.92)",
+    borderRadius: 12,
+    border: "1px solid var(--field-border)",
+    background: "var(--field-bg)",
+    color: "var(--text-primary)",
     outline: "none",
+    transition: "border-color 120ms ease, background-color 120ms ease, box-shadow 120ms ease",
   },
 
   btn: {
     padding: "11px 12px",
-    borderRadius: 16,
-    border: "1px solid rgba(255,255,255,0.12)",
-    background: "rgba(255,255,255,0.08)",
-    color: "rgba(255,255,255,0.92)",
+    borderRadius: 12,
+    border: "1px solid var(--field-border)",
+    background: "var(--field-bg)",
+    color: "var(--text-primary)",
     cursor: "pointer",
     fontWeight: 650,
+    transition: "all 120ms ease",
   },
   btnPrimary: {
-    border: "1px solid rgba(0,205,255,0.28)",
-    background: "linear-gradient(90deg, rgba(0,205,255,0.20), rgba(120,119,198,0.20))",
+    border: "1px solid var(--accent-border)",
+    background: "var(--accent-bg)",
+    boxShadow: "var(--accent-shadow)",
   },
-  btnGhost: { background: "rgba(0,0,0,0.18)" },
+  btnGhost: { background: "var(--ghost-bg)" },
 
-  divider: { height: 1, background: "rgba(255,255,255,0.10)", margin: "14px 0" },
-  controls: { display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 },
+  divider: { height: 1, background: "var(--divider)", margin: "14px 0" },
+  controls: { display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(140px, 1fr))", gap: 10 },
+  restrictedBox: {
+    borderRadius: 12,
+    border: "1px solid var(--field-border)",
+    background: "var(--field-bg)",
+    color: "var(--text-soft)",
+    padding: "12px 12px",
+    fontSize: 13,
+    lineHeight: 1.4,
+  },
   tip: { marginTop: 12, fontSize: 12.5, opacity: 0.8, lineHeight: 1.35 },
 
   listTop: {
@@ -1128,41 +1741,131 @@ const styles = {
   listControls: { display: "flex", gap: 10, flexWrap: "wrap", alignItems: "center" },
   search: {
     padding: "11px 12px",
-    borderRadius: 16,
-    border: "1px solid rgba(255,255,255,0.12)",
-    background: "rgba(0,0,0,0.20)",
-    color: "rgba(255,255,255,0.92)",
+    borderRadius: 12,
+    border: "1px solid var(--field-border)",
+    background: "var(--field-bg)",
+    color: "var(--text-primary)",
     outline: "none",
     minWidth: 240,
   },
   select: {
     padding: "10px 10px",
-    borderRadius: 14,
-    border: "1px solid rgba(255,255,255,0.12)",
-    background: "rgba(0,0,0,0.20)",
-    color: "rgba(255,255,255,0.92)",
+    borderRadius: 12,
+    border: "1px solid var(--field-border)",
+    background: "var(--field-bg)",
+    color: "var(--text-primary)",
     outline: "none",
   },
 
-  list: { display: "flex", flexDirection: "column", gap: 10, marginTop: 8 },
-  empty: { padding: 16, opacity: 0.75 },
+  list: { display: "flex", flexDirection: "column", gap: 10, marginTop: 8, overflow: "visible" },
+  consumableGallery: {
+    marginTop: 10,
+    display: "grid",
+    gap: 12,
+  },
+  consumableCard: {
+    borderRadius: 16,
+    border: "1px solid var(--card-border)",
+    background: "var(--panel-bg)",
+    boxShadow: "var(--shadow-elev)",
+    padding: 14,
+    display: "flex",
+    flexDirection: "column",
+    alignItems: "center",
+    gap: 8,
+    minHeight: 260,
+  },
+  consumableEmoji: {
+    fontSize: 64,
+    lineHeight: 1,
+    marginTop: 2,
+    marginBottom: 2,
+  },
+  consumableName: {
+    fontSize: 18,
+    fontWeight: 700,
+    textAlign: "center",
+    lineHeight: 1.15,
+  },
+  consumableMeta: {
+    fontSize: 12.5,
+    color: "var(--text-muted)",
+    textAlign: "center",
+  },
+  consumableCount: {
+    fontSize: 17,
+    fontWeight: 700,
+    marginTop: 4,
+  },
+  consumableActions: {
+    marginTop: 4,
+    width: "100%",
+    display: "grid",
+    gridTemplateColumns: "1fr 1fr",
+    gap: 8,
+  },
+  qtyBtn: {
+    borderRadius: 12,
+    border: "1px solid var(--field-border)",
+    background: "var(--field-bg)",
+    color: "var(--text-primary)",
+    cursor: "pointer",
+    fontSize: 44,
+    lineHeight: 1,
+    minHeight: 82,
+    fontWeight: 800,
+  },
+  qtyMinus: {
+    background: "var(--ghost-bg)",
+  },
+  qtyPlus: {
+    border: "1px solid var(--accent-border)",
+    background: "var(--accent-bg)",
+  },
+  empty: { padding: 18, opacity: 0.74, border: "1px dashed var(--dash-border)", borderRadius: 14 },
+  overviewStatStack: { display: "flex", flexDirection: "column", gap: 8 },
+  overviewStatRow: {
+    display: "flex",
+    justifyContent: "space-between",
+    alignItems: "center",
+    padding: "10px 12px",
+    borderRadius: 12,
+    border: "1px solid var(--card-border)",
+    background: "var(--panel-bg)",
+  },
+  overviewRow: {
+    padding: "10px 12px",
+    borderRadius: 12,
+    border: "1px solid var(--card-border)",
+    background: "var(--panel-bg)",
+  },
+  lowStockCard: {
+    border: "1px solid rgba(239, 68, 68, 0.5)",
+    boxShadow: "0 0 0 1px rgba(239, 68, 68, 0.24), var(--shadow-elev)",
+  },
+  lowStockRow: {
+    border: "1px solid rgba(239, 68, 68, 0.44)",
+    background: "linear-gradient(180deg, rgba(127, 29, 29, 0.34), rgba(69, 10, 10, 0.22))",
+  },
+  overviewMainText: { fontWeight: 650 },
+  overviewSubText: { marginTop: 4, fontSize: 12.5, color: "var(--text-muted)" },
 
   itemRow: {
     display: "flex",
     gap: 12,
     alignItems: "flex-start",
     padding: 12,
-    borderRadius: 18,
-    border: "1px solid rgba(255,255,255,0.10)",
-    background: "rgba(0,0,0,0.18)",
+    borderRadius: 14,
+    border: "1px solid var(--card-border)",
+    background: "var(--field-bg)",
   },
   check: {
     width: 34,
     height: 34,
-    borderRadius: 12,
-    border: "1px solid rgba(255,255,255,0.16)",
-    background: "rgba(255,255,255,0.06)",
-    color: "rgba(255,255,255,0.95)",
+    borderRadius: 10,
+    border: "1px solid var(--field-border)",
+    background: "var(--panel-bg)",
+    color: "var(--text-primary)",
     cursor: "pointer",
     fontWeight: 900,
     display: "grid",
@@ -1170,15 +1873,15 @@ const styles = {
     flex: "0 0 auto",
   },
   checkOn: {
-    border: "1px solid rgba(0,205,255,0.30)",
-    background: "linear-gradient(180deg, rgba(0,205,255,0.20), rgba(120,119,198,0.18))",
+    border: "1px solid var(--accent-border)",
+    background: "var(--accent-bg)",
   },
 
   itemMain: { flex: "1 1 auto", minWidth: 0 },
   itemTop: { display: "flex", justifyContent: "space-between", gap: 10, alignItems: "center" },
   itemName: {
     fontSize: 15.5,
-    fontWeight: 760,
+    fontWeight: 650,
     lineHeight: 1.2,
     overflow: "hidden",
     textOverflow: "ellipsis",
@@ -1186,59 +1889,71 @@ const styles = {
   },
 
   pill: {
-    fontSize: 12,
+    fontSize: 11.5,
     padding: "6px 10px",
     borderRadius: 999,
-    border: "1px solid rgba(255,255,255,0.12)",
-    background: "rgba(255,255,255,0.06)",
+    border: "1px solid var(--chip-border)",
+    background: "var(--chip-bg)",
     whiteSpace: "nowrap",
+    letterSpacing: 0.4,
+    textTransform: "uppercase",
   },
-  pillOk: { border: "1px solid rgba(0,205,255,0.28)" },
-  pillWarn: { border: "1px solid rgba(255,80,170,0.22)", opacity: 0.9 },
+  pillOk: { border: "1px solid rgba(16, 185, 129, 0.45)", color: "#d1fae5" },
+  pillWarn: { border: "1px solid rgba(251, 191, 36, 0.44)", color: "#fde68a", opacity: 0.95 },
 
   meta: { display: "flex", flexWrap: "wrap", gap: 8, marginTop: 8, opacity: 0.92 },
   badge: {
     fontSize: 12,
     padding: "6px 10px",
     borderRadius: 999,
-    border: "1px solid rgba(255,255,255,0.10)",
-    background: "rgba(255,255,255,0.06)",
+    border: "1px solid var(--field-border)",
+    background: "var(--panel-bg)",
   },
   badgeSoft: {
     fontSize: 12,
     padding: "6px 10px",
     borderRadius: 999,
-    border: "1px solid rgba(120,119,198,0.18)",
-    background: "rgba(120,119,198,0.10)",
+    border: "1px solid var(--chip-soft-border)",
+    background: "var(--chip-soft-bg)",
   },
 
   actions: { display: "flex", flexDirection: "column", gap: 8, flex: "0 0 auto" },
+  readOnlyHint: {
+    fontSize: 11.5,
+    color: "var(--text-muted)",
+    border: "1px dashed var(--dash-border)",
+    borderRadius: 10,
+    padding: "6px 8px",
+    textTransform: "uppercase",
+    letterSpacing: 0.5,
+    textAlign: "center",
+  },
   btnMini: {
     padding: "8px 10px",
-    borderRadius: 14,
-    border: "1px solid rgba(255,255,255,0.12)",
-    background: "rgba(255,255,255,0.08)",
-    color: "rgba(255,255,255,0.92)",
+    borderRadius: 10,
+    border: "1px solid var(--field-border)",
+    background: "var(--panel-bg)",
+    color: "var(--text-primary)",
     cursor: "pointer",
     fontWeight: 650,
     fontSize: 12.5,
   },
   btnMiniPrimary: {
-    border: "1px solid rgba(0,205,255,0.28)",
-    background: "linear-gradient(90deg, rgba(0,205,255,0.18), rgba(120,119,198,0.16))",
+    border: "1px solid var(--accent-border)",
+    background: "var(--accent-bg)",
   },
-  btnMiniGhost: { background: "rgba(0,0,0,0.16)" },
+  btnMiniGhost: { background: "var(--ghost-bg)" },
   btnMiniDanger: {
-    border: "1px solid rgba(255,80,170,0.22)",
-    background: "rgba(255,80,170,0.08)",
+    border: "1px solid rgba(239, 68, 68, 0.42)",
+    background: "rgba(127, 29, 29, 0.32)",
   },
 
   inlineInput: {
     padding: "8px 10px",
-    borderRadius: 14,
-    border: "1px solid rgba(255,255,255,0.12)",
-    background: "rgba(0,0,0,0.20)",
-    color: "rgba(255,255,255,0.92)",
+    borderRadius: 10,
+    border: "1px solid var(--field-border)",
+    background: "var(--field-bg)",
+    color: "var(--text-primary)",
     outline: "none",
     minWidth: 120,
   },
@@ -1250,12 +1965,48 @@ const styles = {
     transform: "translateX(-50%)",
     padding: "10px 14px",
     borderRadius: 999,
-    background: "rgba(0,0,0,0.55)",
-    border: "1px solid rgba(255,255,255,0.12)",
-    backdropFilter: "blur(10px)",
+    background: "var(--toast-bg)",
+    border: "1px solid var(--toast-border)",
+    backdropFilter: "blur(14px)",
+    fontWeight: 700,
+    boxShadow: "var(--accent-shadow)",
+  },
+  modalBackdrop: {
+    position: "fixed",
+    inset: 0,
+    background: "var(--overlay-bg)",
+    backdropFilter: "blur(6px)",
+    zIndex: 1200,
+    display: "grid",
+    placeItems: "center",
+    padding: 16,
+  },
+  modalCard: {
+    width: "min(620px, 100%)",
+    borderRadius: 16,
+    border: "1px solid var(--card-border)",
+    background: "var(--card-bg)",
+    boxShadow: "var(--shadow-modal)",
+    padding: 16,
+  },
+  modalHeader: {
+    display: "flex",
+    alignItems: "center",
+    justifyContent: "space-between",
+    gap: 8,
+    marginBottom: 12,
+  },
+  modalTitle: {
+    fontSize: 14,
+    letterSpacing: 1.1,
+    textTransform: "uppercase",
+    color: "var(--text-muted)",
     fontWeight: 700,
   },
-  footer: { marginTop: 14, opacity: 0.65, fontSize: 12.5 },
+  modalActions: {
+    display: "flex",
+    gap: 10,
+    flexWrap: "wrap",
+  },
+  footer: { marginTop: 14, opacity: 0.66, fontSize: 12.5, color: "var(--text-muted)" },
 };
-
-// quick responsive tweak
