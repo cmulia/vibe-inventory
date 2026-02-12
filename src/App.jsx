@@ -247,7 +247,7 @@ export default function App() {
   const [currentName, setCurrentName] = useState("");
   const [isAdmin, setIsAdmin] = useState(false);
   const [theme, setTheme] = useState(() => localStorage.getItem(THEME_KEY) || "dark");
-  const [activePage, setActivePage] = useState("consumables"); // overview | equipment | consumables
+  const [activePage, setActivePage] = useState("consumables"); // overview | equipment | consumables | feedback
   const [authIdentity, setAuthIdentity] = useState({ id: "", email: "" });
 
   const [authToast, setAuthToast] = useState("");
@@ -263,6 +263,9 @@ export default function App() {
   const [sort, setSort] = useState("recent"); // recent | unsorted | name | location
   const [toast, setToast] = useState("");
   const [toastLeaving, setToastLeaving] = useState(false);
+  const [feedbackRows, setFeedbackRows] = useState([]);
+  const [showFeedbackDialog, setShowFeedbackDialog] = useState(false);
+  const [consumableJump, setConsumableJump] = useState(null);
   const [isAdding, setIsAdding] = useState(false);
   const [showAddDialog, setShowAddDialog] = useState(false);
   const [addError, setAddError] = useState("");
@@ -274,6 +277,7 @@ export default function App() {
     if (!currentUser) return;
     loadInventoryFromDb();
     loadConsumablesFromDb();
+    loadFeedbacksFromDb();
   }, [currentUser]);
 
 
@@ -314,6 +318,43 @@ export default function App() {
     }
   }, [isAdmin, activePage]);
 
+  useEffect(() => {
+    loadFeedbacksFromDb();
+  }, [isAdmin, authIdentity.id, currentUser]);
+
+  useEffect(() => {
+    if (!currentUser) return;
+
+    const channel = supabase
+      .channel("inventory-consumables-realtime")
+      .on(
+        "postgres_changes",
+        { event: "*", schema: "public", table: "consumables_items" },
+        () => {
+          loadConsumablesFromDb();
+        }
+      )
+      .on(
+        "postgres_changes",
+        { event: "*", schema: "public", table: "inventory_items" },
+        () => {
+          loadInventoryFromDb();
+        }
+      )
+      .on(
+        "postgres_changes",
+        { event: "*", schema: "public", table: "feedback_entries" },
+        () => {
+          loadFeedbacksFromDb();
+        }
+      )
+      .subscribe();
+
+    return () => {
+      supabase.removeChannel(channel);
+    };
+  }, [currentUser, isAdmin]);
+
   async function loadInventoryFromDb() {
   const { data, error } = await supabase
     .from("inventory_items")
@@ -346,8 +387,8 @@ export default function App() {
   async function loadConsumablesFromDb() {
     const { data, error } = await supabase
       .from("consumables_items")
-      .select("id, created_at, name, category, unit, location, on_hand, min_level, updated_at")
-      .order("updated_at", { ascending: false });
+      .select("*")
+      .order("created_at", { ascending: true });
 
     if (error) {
       setToast("Consumables load error: " + error.message);
@@ -366,6 +407,8 @@ export default function App() {
           location: String(x.location || CONSUMABLE_LOCATIONS[0]),
           on_hand: Number(x.onHand || 0) || 0,
           min_level: Number(x.minLevel || 0) || 0,
+          updated_by_name: currentName || currentUser || "Unknown",
+          updated_by_username: currentUser || "unknown",
         }));
         const { error: insertError } = await supabase.from("consumables_items").insert(insertRows);
         if (!insertError) {
@@ -384,10 +427,29 @@ export default function App() {
       location: String(r.location || CONSUMABLE_LOCATIONS[0]),
       onHand: Number(r.on_hand || 0) || 0,
       minLevel: Number(r.min_level || 0) || 0,
+      changedByName: String(r.updated_by_name || ""),
+      changedByUsername: String(r.updated_by_username || ""),
       updatedAt: r.updated_at ? new Date(r.updated_at).getTime() : Date.now(),
     }));
 
     setConsumables(mapped);
+  }
+
+  async function loadFeedbacksFromDb() {
+    let query = supabase
+      .from("feedback_entries")
+      .select("id, created_at, message, sender_name, sender_username, sender_user_id, resolved")
+      .order("created_at", { ascending: false })
+      .limit(200);
+
+    if (!isAdmin) {
+      if (authIdentity?.id) query = query.eq("sender_user_id", authIdentity.id);
+      else if (currentUser) query = query.eq("sender_username", currentUser);
+    }
+
+    const { data, error } = await query;
+    if (error) return;
+    setFeedbackRows(Array.isArray(data) ? data : []);
   }
 
 
@@ -699,6 +761,8 @@ export default function App() {
       location,
       on_hand: onHand,
       min_level: minLevel,
+      updated_by_name: currentName || currentUser || "Unknown",
+      updated_by_username: currentUser || "unknown",
     };
     const { error } = await supabase.from("consumables_items").insert([row], { returning: "minimal" });
     if (error) {
@@ -717,7 +781,12 @@ export default function App() {
     const nextOnHand = Math.max(0, Number(current.onHand || 0) + delta);
     const { error } = await supabase
       .from("consumables_items")
-      .update({ on_hand: nextOnHand, updated_at: new Date().toISOString() })
+      .update({
+        on_hand: nextOnHand,
+        updated_at: new Date().toISOString(),
+        updated_by_name: currentName || currentUser || "Unknown",
+        updated_by_username: currentUser || "unknown",
+      })
       .eq("id", id);
     if (error) {
       setToast("Consumable update error: " + error.message);
@@ -738,6 +807,46 @@ export default function App() {
     }
     await loadConsumablesFromDb();
     setToast("Consumable removed");
+  }
+
+  async function submitFeedback(e) {
+    e.preventDefault();
+    const form = e.currentTarget;
+    const fd = new FormData(form);
+    const message = String(fd.get("message") || "").trim();
+    if (!message) return;
+
+    const payload = {
+      id: genUuid(),
+      message,
+      sender_name: currentName || currentUser || "Unknown",
+      sender_username: currentUser || "unknown",
+      sender_user_id: authIdentity.id || null,
+      resolved: false,
+    };
+
+    const { error } = await supabase.from("feedback_entries").insert([payload], { returning: "minimal" });
+    if (error) {
+      setToast("Feedback send error: " + error.message);
+      return;
+    }
+    form.reset();
+    setShowFeedbackDialog(false);
+    setToast("Feedback submitted");
+  }
+
+  async function toggleFeedbackResolved(id, nextResolved) {
+    if (!isAdmin) return;
+    const { error } = await supabase
+      .from("feedback_entries")
+      .update({ resolved: !!nextResolved })
+      .eq("id", id);
+    if (error) {
+      setToast("Feedback update error: " + error.message);
+      return;
+    }
+    await loadFeedbacksFromDb();
+    setToast(nextResolved ? "Marked resolved" : "Marked unresolved");
   }
 
   async function onSignup(nameRaw, usernameRaw, password) {
@@ -809,9 +918,11 @@ export default function App() {
     setCurrentName("");
     setIsAdmin(false);
     setShowAddDialog(false);
+    setShowFeedbackDialog(false);
     setAuthIdentity({ id: "", email: "" });
     setItems([]);
     setConsumables([]);
+    setFeedbackRows([]);
     setQuery("");
     setFilter("all");
     setSort("recent");
@@ -928,10 +1039,40 @@ export default function App() {
           >
             Consumables
           </button>
+          <button
+            onClick={() => setActivePage("feedback")}
+            style={{ ...styles.tabBtn, ...(activePage === "feedback" ? styles.tabBtnActive : {}) }}
+          >
+            Feedback
+          </button>
         </div>
 
+        <section
+          style={{
+            ...styles.statusCard,
+            ...(consumableStats.low > 0 ? styles.statusBad : styles.statusGood),
+          }}
+          className="fade-up"
+        >
+          {consumableStats.low > 0
+            ? "Oh no, check in what needs to be refilled"
+            : "Great job, everything is in good quantity"}
+        </section>
+
         {activePage === "overview" ? (
-          <OverviewPage consumableStats={consumableStats} consumables={consumables} isAdmin={isAdmin} />
+          <OverviewPage
+            consumableStats={consumableStats}
+            consumables={consumables}
+            isAdmin={isAdmin}
+            onLowStockSelect={(item) => {
+              setActivePage("consumables");
+              setConsumableJump({
+                id: item.id,
+                location: item.location || "",
+                at: Date.now(),
+              });
+            }}
+          />
         ) : null}
 
         {activePage === "equipment" && isAdmin ? (
@@ -1051,6 +1192,16 @@ export default function App() {
             onAdjust={adjustConsumable}
             onDelete={removeConsumable}
             onNoPrivilege={() => setToast("You don't have priviledge, please contact admin")}
+            jumpTarget={consumableJump}
+          />
+        ) : null}
+
+        {activePage === "feedback" ? (
+          <FeedbackPage
+            isAdmin={isAdmin}
+            feedbackRows={feedbackRows}
+            onOpenForm={() => setShowFeedbackDialog(true)}
+            onToggleResolved={toggleFeedbackResolved}
           />
         ) : null}
 
@@ -1097,6 +1248,43 @@ export default function App() {
                 </div>
                 {addError ? <div style={{ fontSize: 12, color: "#fca5a5" }}>{addError}</div> : null}
                 {addDebug ? <div style={{ fontSize: 12, opacity: 0.85 }}>{addDebug}</div> : null}
+              </form>
+            </div>
+          </div>
+        ) : null}
+
+        {showFeedbackDialog ? (
+          <div style={styles.modalBackdrop} onClick={() => setShowFeedbackDialog(false)}>
+            <div style={styles.modalCard} onClick={(e) => e.stopPropagation()}>
+              <div style={styles.modalHeader}>
+                <div style={styles.modalTitle}>Send feedback</div>
+                <button
+                  type="button"
+                  onClick={() => setShowFeedbackDialog(false)}
+                  style={{ ...styles.btnMini, ...styles.btnMiniGhost }}
+                >
+                  Close
+                </button>
+              </div>
+              <form onSubmit={submitFeedback} style={styles.form}>
+                <textarea
+                  name="message"
+                  required
+                  placeholder="Write your feedback here..."
+                  style={{ ...styles.input, minHeight: 120, resize: "vertical" }}
+                />
+                <div style={styles.modalActions}>
+                  <button type="submit" style={{ ...styles.btn, ...styles.btnPrimary }}>
+                    Submit feedback
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setShowFeedbackDialog(false)}
+                    style={{ ...styles.btn, ...styles.btnGhost }}
+                  >
+                    Cancel
+                  </button>
+                </div>
               </form>
             </div>
           </div>
@@ -1200,7 +1388,7 @@ function AuthScreen({ toast, onSignup, onLogin, theme, onToggleTheme }) {
   );
 }
 
-function OverviewPage({ consumableStats, consumables, isAdmin }) {
+function OverviewPage({ consumableStats, consumables, isAdmin, onLowStockSelect }) {
   const recentConsumables = [...consumables].sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0)).slice(0, 5);
   const lowRows = consumables
     .filter((c) => Number(c.onHand || 0) <= Number(c.minLevel || 0))
@@ -1221,12 +1409,17 @@ function OverviewPage({ consumableStats, consumables, isAdmin }) {
         <div style={styles.cardTitle}>Low-stock alert</div>
         <div style={styles.list}>
           {lowRows.length ? lowRows.map((c) => (
-            <div key={c.id} style={{ ...styles.overviewRow, ...styles.lowStockRow }}>
+            <button
+              key={c.id}
+              type="button"
+              onClick={() => onLowStockSelect?.(c)}
+              style={{ ...styles.overviewRow, ...styles.lowStockRow, ...styles.lowStockTap }}
+            >
               <div style={styles.overviewMainText}>{c.name}</div>
               <div style={styles.overviewSubText}>
                 {c.onHand} {c.unit} left (min {c.minLevel}) · {c.location || "Unassigned"}
               </div>
-            </div>
+            </button>
           )) : <div style={styles.empty}>No low-stock consumables.</div>}
         </div>
       </section>
@@ -1239,7 +1432,7 @@ function OverviewPage({ consumableStats, consumables, isAdmin }) {
               <div key={c.id} style={styles.overviewRow}>
                 <div style={styles.overviewMainText}>{c.name}</div>
                 <div style={styles.overviewSubText}>
-                  {c.onHand} {c.unit || "pcs"} on hand · {c.location || "Unassigned"} · {fmtTime(c.updatedAt)}
+                  {c.onHand} {c.unit || "pcs"} on hand · {c.location || "Unassigned"} · by {c.changedByName || c.changedByUsername || "Unknown"} · {fmtTime(c.updatedAt)}
                 </div>
               </div>
             )) : <div style={styles.empty}>No recent activity.</div>}
@@ -1250,7 +1443,7 @@ function OverviewPage({ consumableStats, consumables, isAdmin }) {
   );
 }
 
-function ConsumablesPage({ consumables, isAdmin, onAdd, onAdjust, onDelete, onNoPrivilege }) {
+function ConsumablesPage({ consumables, isAdmin, onAdd, onAdjust, onDelete, onNoPrivilege, jumpTarget }) {
   const [locationFilter, setLocationFilter] = useState("");
   const [showAddConsumable, setShowAddConsumable] = useState(false);
 
@@ -1269,6 +1462,19 @@ function ConsumablesPage({ consumables, isAdmin, onAdd, onAdjust, onDelete, onNo
   const filteredConsumables = locationFilter
     ? consumables.filter((c) => String(c.location || "") === locationFilter)
     : [];
+
+  useEffect(() => {
+    if (!jumpTarget?.id) return;
+    if (jumpTarget.location) setLocationFilter(jumpTarget.location);
+  }, [jumpTarget?.at]);
+
+  useEffect(() => {
+    if (!jumpTarget?.id) return;
+    if (jumpTarget.location && locationFilter !== jumpTarget.location) return;
+    const el = document.getElementById(`consumable-${jumpTarget.id}`);
+    if (!el) return;
+    el.scrollIntoView({ behavior: "smooth", block: "center" });
+  }, [jumpTarget?.at, locationFilter, filteredConsumables.length]);
 
   function openAddConsumable() {
     if (!isAdmin) {
@@ -1318,7 +1524,7 @@ function ConsumablesPage({ consumables, isAdmin, onAdd, onAdjust, onDelete, onNo
             {filteredConsumables.map((c) => {
               const low = Number(c.onHand || 0) <= Number(c.minLevel || 0);
               return (
-                <article key={c.id} style={styles.consumableCard}>
+                <article id={`consumable-${c.id}`} key={c.id} style={styles.consumableCard}>
                   <div style={styles.consumableEmoji}>{consumableEmoji(c)}</div>
                   <div style={styles.consumableName}>{c.name}</div>
                   <div style={styles.consumableMeta}>
@@ -1395,6 +1601,82 @@ function ConsumablesPage({ consumables, isAdmin, onAdd, onAdjust, onDelete, onNo
           </div>
         </div>
       ) : null}
+    </div>
+  );
+}
+
+function FeedbackPage({ isAdmin, feedbackRows, onOpenForm, onToggleResolved }) {
+  return (
+    <div style={styles.fullWidthStack}>
+      <section style={styles.card} className="fade-up">
+        <div style={styles.listTop}>
+          <div style={styles.cardTitle}>Feedback</div>
+          <button onClick={onOpenForm} style={{ ...styles.btn, ...styles.btnPrimary }}>
+            Send feedback
+          </button>
+        </div>
+        <div style={styles.feedbackHelp}>
+          Share issues, requests, and ideas for improving inventory workflow.
+        </div>
+      </section>
+
+      {isAdmin ? (
+        <section style={{ ...styles.card, ...styles.cardTall }} className="fade-up">
+          <div style={styles.cardTitle}>Submitted feedback (admin)</div>
+          <div style={styles.list}>
+            {feedbackRows.length === 0 ? (
+              <div style={styles.empty}>No feedback submitted yet.</div>
+            ) : (
+              feedbackRows.map((f) => (
+                <div key={f.id} style={styles.feedbackRow}>
+                  <div style={styles.feedbackTop}>
+                    <b>{f.sender_name || "Unknown"}</b>
+                    <div style={styles.feedbackMetaWrap}>
+                      <span style={styles.overviewSubText}>
+                        @{f.sender_username || "unknown"} · {fmtTime(new Date(f.created_at).getTime())}
+                      </span>
+                      <span style={{ ...styles.feedbackStatus, ...(f.resolved ? styles.feedbackResolved : styles.feedbackUnresolved) }}>
+                        {f.resolved ? "Resolved" : "Unresolved"}
+                      </span>
+                    </div>
+                  </div>
+                  <div>{f.message}</div>
+                  <div style={styles.feedbackActions}>
+                    <button
+                      type="button"
+                      onClick={() => onToggleResolved(f.id, !f.resolved)}
+                      style={{ ...styles.btnMini, ...(f.resolved ? styles.btnMiniGhost : styles.btnMiniPrimary) }}
+                    >
+                      {f.resolved ? "Unresolve" : "Resolve"}
+                    </button>
+                  </div>
+                </div>
+              ))
+            )}
+          </div>
+        </section>
+      ) : (
+        <section style={styles.card} className="fade-up">
+          <div style={styles.cardTitle}>My feedback</div>
+          <div style={styles.list}>
+            {feedbackRows.length === 0 ? (
+              <div style={styles.empty}>No feedback submitted yet.</div>
+            ) : (
+              feedbackRows.map((f) => (
+                <div key={f.id} style={styles.feedbackRow}>
+                  <div style={styles.feedbackTop}>
+                    <span style={styles.overviewSubText}>{fmtTime(new Date(f.created_at).getTime())}</span>
+                    <span style={{ ...styles.feedbackStatus, ...(f.resolved ? styles.feedbackResolved : styles.feedbackUnresolved) }}>
+                      {f.resolved ? "Resolved" : "Unresolved"}
+                    </span>
+                  </div>
+                  <div>{f.message}</div>
+                </div>
+              ))
+            )}
+          </div>
+        </section>
+      )}
     </div>
   );
 }
@@ -1732,6 +2014,25 @@ const styles = {
     background: "var(--tab-active-bg)",
     color: "var(--tab-active-text)",
   },
+  statusCard: {
+    marginBottom: 14,
+    borderRadius: 14,
+    padding: "12px 14px",
+    fontWeight: 700,
+    fontSize: 15,
+    border: "1px solid var(--field-border)",
+    background: "var(--panel-bg)",
+  },
+  statusGood: {
+    border: "1px solid rgba(16, 185, 129, 0.55)",
+    background: "linear-gradient(180deg, rgba(16, 185, 129, 0.2), rgba(6, 78, 59, 0.18))",
+    color: "var(--text-primary)",
+  },
+  statusBad: {
+    border: "1px solid rgba(239, 68, 68, 0.6)",
+    background: "linear-gradient(180deg, rgba(239, 68, 68, 0.2), rgba(127, 29, 29, 0.2))",
+    color: "var(--text-primary)",
+  },
 
   grid: {
     display: "grid",
@@ -1898,6 +2199,58 @@ const styles = {
     border: "1px solid var(--accent-border)",
     background: "var(--accent-bg)",
   },
+  feedbackHelp: {
+    color: "var(--text-soft)",
+    fontSize: 14,
+    lineHeight: 1.45,
+  },
+  feedbackRow: {
+    padding: "12px 14px",
+    borderRadius: 12,
+    border: "1px solid var(--card-border)",
+    background: "var(--panel-bg)",
+    display: "flex",
+    flexDirection: "column",
+    gap: 6,
+  },
+  feedbackTop: {
+    display: "flex",
+    justifyContent: "space-between",
+    alignItems: "center",
+    gap: 10,
+    flexWrap: "wrap",
+  },
+  feedbackMetaWrap: {
+    display: "flex",
+    alignItems: "center",
+    gap: 8,
+    flexWrap: "wrap",
+    justifyContent: "flex-end",
+  },
+  feedbackStatus: {
+    padding: "4px 10px",
+    borderRadius: 999,
+    fontSize: 11.5,
+    fontWeight: 700,
+    border: "1px solid var(--field-border)",
+    textTransform: "uppercase",
+    letterSpacing: 0.4,
+  },
+  feedbackResolved: {
+    border: "1px solid rgba(16, 185, 129, 0.55)",
+    background: "rgba(16, 185, 129, 0.2)",
+    color: "var(--text-primary)",
+  },
+  feedbackUnresolved: {
+    border: "1px solid rgba(239, 68, 68, 0.55)",
+    background: "rgba(239, 68, 68, 0.16)",
+    color: "var(--text-primary)",
+  },
+  feedbackActions: {
+    display: "flex",
+    justifyContent: "flex-end",
+    marginTop: 2,
+  },
   empty: { padding: 18, opacity: 0.74, border: "1px dashed var(--dash-border)", borderRadius: 14 },
   overviewStatStack: { display: "flex", flexDirection: "column", gap: 8 },
   overviewStatRow: {
@@ -1926,6 +2279,11 @@ const styles = {
   lowStockRow: {
     border: "1px solid rgba(239, 68, 68, 0.44)",
     background: "linear-gradient(180deg, rgba(127, 29, 29, 0.34), rgba(69, 10, 10, 0.22))",
+  },
+  lowStockTap: {
+    width: "100%",
+    textAlign: "left",
+    cursor: "pointer",
   },
   overviewMainText: { fontWeight: 650 },
   overviewSubText: { marginTop: 4, fontSize: 12.5, color: "var(--text-muted)" },
