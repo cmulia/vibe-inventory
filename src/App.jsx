@@ -269,6 +269,8 @@ export default function App() {
   const [feedbackRows, setFeedbackRows] = useState([]);
   const [showFeedbackDialog, setShowFeedbackDialog] = useState(false);
   const [consumableJump, setConsumableJump] = useState(null);
+  const [equipmentJump, setEquipmentJump] = useState(null);
+  const [globalSearch, setGlobalSearch] = useState("");
   const [isAdding, setIsAdding] = useState(false);
   const [showAddDialog, setShowAddDialog] = useState(false);
   const [addError, setAddError] = useState("");
@@ -491,6 +493,67 @@ export default function App() {
 
     return out;
   }, [items, query, filter, sort]);
+
+  const globalSearchResults = useMemo(() => {
+    const q = globalSearch.trim().toLowerCase();
+    if (!q) return [];
+
+    const results = [];
+
+    for (const item of items) {
+      const name = String(item.name || "");
+      if (!name.toLowerCase().includes(q)) continue;
+      results.push({
+        id: item.id,
+        name,
+        page: "equipment",
+        meta: item.location || "No location",
+      });
+    }
+
+    for (const row of consumables) {
+      const name = String(row.name || "");
+      if (!name.toLowerCase().includes(q)) continue;
+      results.push({
+        id: row.id,
+        name,
+        page: "consumables",
+        meta: row.location || "No location",
+      });
+    }
+
+    return results
+      .filter((r) => r.page !== "equipment" || isAdmin)
+      .slice(0, 8);
+  }, [globalSearch, items, consumables, isAdmin]);
+
+  useEffect(() => {
+    if (activePage !== "equipment") return;
+    if (!equipmentJump?.id) return;
+    const el = document.getElementById(`equipment-${equipmentJump.id}`);
+    if (!el) return;
+    el.scrollIntoView({ behavior: "smooth", block: "center" });
+  }, [activePage, equipmentJump?.at, filtered.length]);
+
+  function jumpToSearchResult(result) {
+    if (result.page === "equipment") {
+      if (!isAdmin) {
+        setToast("You don't have priviledge, please contact admin");
+        return;
+      }
+      setActivePage("equipment");
+      setQuery(result.name);
+      setFilter("all");
+      setSort("recent");
+      setEquipmentJump({ id: result.id, at: Date.now() });
+      setGlobalSearch("");
+      return;
+    }
+
+    setActivePage("consumables");
+    setConsumableJump({ id: result.id, location: result.meta || "", at: Date.now() });
+    setGlobalSearch("");
+  }
 
   async function upsertItem(partial) {
   const isCheckedOnlyUpdate =
@@ -1092,6 +1155,37 @@ export default function App() {
           </button>
         </div>
 
+        <section style={styles.card} className="fade-up">
+          <div style={styles.cardTitle}>Search items</div>
+          <input
+            value={globalSearch}
+            onChange={(e) => setGlobalSearch(e.target.value)}
+            placeholder="Search by item name..."
+            style={{ ...styles.search, width: "100%", minWidth: 0 }}
+          />
+          {globalSearch.trim() ? (
+            <div style={styles.searchResultList}>
+              {globalSearchResults.length === 0 ? (
+                <div style={styles.empty}>No item name matches.</div>
+              ) : (
+                globalSearchResults.map((result) => (
+                  <button
+                    key={`${result.page}-${result.id}`}
+                    type="button"
+                    onClick={() => jumpToSearchResult(result)}
+                    style={styles.searchResultBtn}
+                  >
+                    <div style={styles.searchResultTitle}>{result.name}</div>
+                    <div style={styles.searchResultMeta}>
+                      {result.page === "equipment" ? "Equipment" : "Consumables"} · {result.meta}
+                    </div>
+                  </button>
+                ))
+              )}
+            </div>
+          ) : null}
+        </section>
+
         <section
           style={{
             ...styles.statusCard,
@@ -1216,6 +1310,7 @@ export default function App() {
                   filtered.map((it) => (
                     <ItemRow
                       key={it.id}
+                      rowId={`equipment-${it.id}`}
                       item={it}
                       onToggle={() => upsertItem({ id: it.id, checked: !it.checked })}
                       onEdit={(patch) => upsertItem({ id: it.id, ...patch })}
@@ -1749,7 +1844,7 @@ function Input(props) {
   return <input {...props} style={styles.input} />;
 }
 
-function ItemRow({ item, onToggle, onEdit, onDelete, canManage }) {
+function ItemRow({ rowId, item, onToggle, onEdit, onDelete, canManage }) {
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState({
     name: item.name,
@@ -1772,7 +1867,7 @@ function ItemRow({ item, onToggle, onEdit, onDelete, canManage }) {
   const pill = item.checked ? styles.pillOk : styles.pillWarn;
 
   return (
-    <div style={styles.itemRow}>
+    <div id={rowId} style={styles.itemRow}>
       <button onClick={onToggle} style={{ ...styles.check, ...(item.checked ? styles.checkOn : {}) }}>
         {item.checked ? "✓" : ""}
       </button>
@@ -2179,6 +2274,31 @@ const styles = {
     color: "var(--text-primary)",
     outline: "none",
     minWidth: 240,
+  },
+  searchResultList: {
+    display: "flex",
+    flexDirection: "column",
+    gap: 8,
+    marginTop: 10,
+  },
+  searchResultBtn: {
+    width: "100%",
+    textAlign: "left",
+    borderRadius: 12,
+    border: "1px solid var(--card-border)",
+    background: "var(--panel-bg)",
+    color: "var(--text-primary)",
+    padding: "10px 12px",
+    cursor: "pointer",
+  },
+  searchResultTitle: {
+    fontWeight: 650,
+    lineHeight: 1.2,
+  },
+  searchResultMeta: {
+    marginTop: 4,
+    fontSize: 12,
+    color: "var(--text-muted)",
   },
   select: {
     padding: "10px 10px",
