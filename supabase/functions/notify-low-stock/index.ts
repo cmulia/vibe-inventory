@@ -4,6 +4,16 @@ import { createClient } from "https://esm.sh/@supabase/supabase-js@2.38.1";
 const supabaseUrl = Deno.env.get("SUPABASE_URL");
 const supabaseKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
 const resendKey = Deno.env.get("RESEND_API_KEY");
+const fromEmail = Deno.env.get("RESEND_FROM_EMAIL") || "alerts@inventory-vibe.local";
+const corsHeaders = {
+  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Allow-Headers": "authorization, x-client-info, apikey, content-type",
+  "Access-Control-Allow-Methods": "POST, OPTIONS",
+};
+
+if (!supabaseUrl || !supabaseKey) {
+  throw new Error("Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY");
+}
 
 const supabase = createClient(supabaseUrl, supabaseKey);
 
@@ -18,21 +28,33 @@ interface LowStockPayload {
 }
 
 serve(async (req: Request) => {
+  if (req.method === "OPTIONS") {
+    return new Response("ok", { headers: corsHeaders });
+  }
+
   // Only accept POST
   if (req.method !== "POST") {
     return new Response(JSON.stringify({ error: "Method not allowed" }), {
       status: 405,
+      headers: { ...corsHeaders, "Content-Type": "application/json" },
     });
   }
 
   try {
+    if (!resendKey) {
+      return new Response(
+        JSON.stringify({ error: "Missing RESEND_API_KEY in Edge Function secrets" }),
+        { status: 500, headers: { ...corsHeaders, "Content-Type": "application/json" } }
+      );
+    }
+
     const payload: LowStockPayload = await req.json();
 
     // Validate payload
     if (!payload.consumable_id || !payload.name) {
       return new Response(
         JSON.stringify({ error: "Missing required fields" }),
-        { status: 400 }
+        { status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" } }
       );
     }
 
@@ -58,7 +80,7 @@ serve(async (req: Request) => {
           success: true,
           message: "Notification already sent today for this item",
         }),
-        { status: 200 }
+        { status: 200, headers: { ...corsHeaders, "Content-Type": "application/json" } }
       );
     }
 
@@ -72,7 +94,7 @@ serve(async (req: Request) => {
       console.error("Error fetching admin users:", adminError);
       return new Response(
         JSON.stringify({ error: "Failed to fetch admin users" }),
-        { status: 500 }
+        { status: 500, headers: { ...corsHeaders, "Content-Type": "application/json" } }
       );
     }
 
@@ -89,7 +111,7 @@ serve(async (req: Request) => {
 
       return new Response(
         JSON.stringify({ error: "No admin users with email configured" }),
-        { status: 400 }
+        { status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" } }
       );
     }
 
@@ -118,7 +140,7 @@ serve(async (req: Request) => {
         JSON.stringify({
           error: "No admin users with real email addresses configured",
         }),
-        { status: 400 }
+        { status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" } }
       );
     }
 
@@ -128,7 +150,7 @@ serve(async (req: Request) => {
         .replace(/&/g, "&amp;")
         .replace(/</g, "&lt;")
         .replace(/>/g, "&gt;")
-        .replace(/"/g, "&quot;")
+        .replace(/\"/g, "&quot;")
         .replace(/'/g, "&#039;");
     }
 
@@ -165,7 +187,7 @@ serve(async (req: Request) => {
         "Content-Type": "application/json",
       },
       body: JSON.stringify({
-        from: "alerts@inventory-vibe.local",
+        from: fromEmail,
         to: realEmails,
         subject: `LOW STOCK ALERT: ${payload.name}`,
         html: htmlContent,
@@ -190,7 +212,7 @@ serve(async (req: Request) => {
         JSON.stringify({
           error: `Resend error: ${resendResponse.status}`,
         }),
-        { status: 500 }
+        { status: 500, headers: { ...corsHeaders, "Content-Type": "application/json" } }
       );
     }
 
@@ -209,14 +231,13 @@ serve(async (req: Request) => {
         sent_to: realEmails,
         message: `Low stock notification sent to ${realEmails.length} admin(s)`,
       }),
-      { status: 200, headers: { "Content-Type": "application/json" } }
+      { status: 200, headers: { ...corsHeaders, "Content-Type": "application/json" } }
     );
   } catch (error) {
     console.error("Error in notify-low-stock function:", error);
     return new Response(
       JSON.stringify({ error: error.message }),
-      { status: 500, headers: { "Content-Type": "application/json" } }
+      { status: 500, headers: { ...corsHeaders, "Content-Type": "application/json" } }
     );
   }
 });
-

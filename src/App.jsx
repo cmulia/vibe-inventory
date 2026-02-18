@@ -876,20 +876,20 @@ export default function App() {
           unit: current.unit || "pcs",
           updated_by_name: currentName || currentUser || "Unknown",
         };
-        console.log("Calling notify-low-stock with payload:", payload);
-        const response = await fetch(
-          `${import.meta.env.VITE_SUPABASE_URL}/functions/v1/notify-low-stock`,
-          {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify(payload),
-          }
+        const { data: notifyData, error: notifyError } = await supabase.functions.invoke(
+          "notify-low-stock",
+          { body: payload }
         );
-        console.log("notify-low-stock response status:", response.status);
-        const responseData = await response.json();
-        console.log("notify-low-stock response data:", responseData);
+        if (notifyError) {
+          console.error("notify-low-stock invoke error:", notifyError);
+          setToast("Low-stock email trigger failed. Check Edge Function logs.");
+        } else {
+          console.log("notify-low-stock response data:", notifyData);
+          if (notifyData?.message) setToast(notifyData.message);
+        }
       } catch (err) {
         console.error("Failed to trigger notification:", err);
+        setToast("Low-stock email trigger failed. Check Edge Function logs.");
       }
     }
 
