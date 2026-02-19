@@ -252,6 +252,7 @@ export default function App() {
   const [theme, setTheme] = useState(() => localStorage.getItem(THEME_KEY) || "dark");
   const [activePage, setActivePage] = useState("consumables"); // overview | equipment | consumables | feedback
   const [authIdentity, setAuthIdentity] = useState({ id: "", email: "" });
+  const [authAccessToken, setAuthAccessToken] = useState("");
 
   const [authToast, setAuthToast] = useState("");
 
@@ -271,6 +272,9 @@ export default function App() {
   const [consumableJump, setConsumableJump] = useState(null);
   const [equipmentJump, setEquipmentJump] = useState(null);
   const [globalSearch, setGlobalSearch] = useState("");
+  const [userDirectory, setUserDirectory] = useState([]);
+  const [userDirectoryLoading, setUserDirectoryLoading] = useState(false);
+  const [userDirectoryError, setUserDirectoryError] = useState("");
   const [isAdding, setIsAdding] = useState(false);
   const [showAddDialog, setShowAddDialog] = useState(false);
   const [addError, setAddError] = useState("");
@@ -318,7 +322,7 @@ export default function App() {
   }, [theme]);
 
   useEffect(() => {
-    if (!isAdmin && activePage === "equipment") {
+    if (!isAdmin && (activePage === "equipment" || activePage === "users")) {
       setActivePage("consumables");
     }
   }, [isAdmin, activePage]);
@@ -326,6 +330,19 @@ export default function App() {
   useEffect(() => {
     loadFeedbacksFromDb();
   }, [isAdmin, authIdentity.id, currentUser]);
+
+  useEffect(() => {
+    if (isAdmin && activePage === "users") {
+      loadUserDirectory();
+    }
+  }, [isAdmin, activePage]);
+
+  useEffect(() => {
+    if (!authIdentity.id) return;
+    touchLastActive(authIdentity.id);
+    const t = setInterval(() => touchLastActive(authIdentity.id), 5 * 60 * 1000);
+    return () => clearInterval(t);
+  }, [authIdentity.id]);
 
   useEffect(() => {
     if (!currentUser) return;
@@ -455,6 +472,144 @@ export default function App() {
     const { data, error } = await query;
     if (error) return;
     setFeedbackRows(Array.isArray(data) ? data : []);
+  }
+
+  function profileDisplayName(row) {
+    const realEmail = String(row?.real_email || "");
+    const email = String(row?.email || "");
+    const source = realEmail && realEmail.includes("@") ? realEmail : email;
+    if (source) return actorDisplayName(source);
+    return String(row?.user_id || "?");
+  }
+
+  function profileRoleLabel(row) {
+    const rawRole = String(row?.role || "").toLowerCase();
+    if (rawRole === "admin") return "Admin";
+    const email = String(row?.email || row?.real_email || "");
+    const username = email ? email.split("@")[0] : "";
+    if (isAdminIdentity({ email, user_metadata: { username } }, username)) return "Admin";
+    return "User";
+  }
+
+  function profileLastActive(row) {
+    const val = row?.last_active || row?.updated_at || row?.created_at;
+    if (!val) return "";
+    const ms = typeof val === "number" ? val : new Date(val).getTime();
+    return fmtTime(ms);
+  }
+
+  async function touchLastActive(userId) {
+    if (!userId) return;
+    const { error } = await supabase
+      .from("user_profiles")
+      .update({ last_active: new Date().toISOString() })
+      .eq("user_id", userId);
+    if (error) return;
+  }
+
+  async function refreshAdminRole(userId, identityAdmin) {
+    if (!userId) return;
+    const { data, error } = await supabase
+      .from("user_profiles")
+      .select("role")
+      .eq("user_id", userId)
+      .maybeSingle();
+    if (error) return;
+    const profileAdmin = String(data?.role || "").toLowerCase() === "admin";
+    setIsAdmin(identityAdmin || profileAdmin);
+  }
+
+  async function loadUserDirectory() {
+    if (!isAdmin) return;
+    setUserDirectoryLoading(true);
+    setUserDirectoryError("");
+    const timeoutMs = 8000;
+    let debugUrl = "";
+    let settled = false;
+    const safetyTimer = setTimeout(() => {
+      if (!settled) {
+        const suffix = debugUrl ? ` (url: ${debugUrl})` : "";
+        setUserDirectoryError(`User directory request timed out${suffix}`);
+        setUserDirectoryLoading(false);
+      }
+    }, timeoutMs + 1500);
+    const timeoutPromise = new Promise((_, reject) => {
+      setTimeout(() => reject(new Error("User directory request timed out")), timeoutMs);
+    });
+    try {
+      const supabaseUrl = import.meta.env.VITE_SUPABASE_URL;
+      const supabaseKey = import.meta.env.VITE_SUPABASE_ANON_KEY;
+      debugUrl = supabaseUrl || "";
+      if (!supabaseUrl || !supabaseKey) {
+        setUserDirectoryError("Missing Supabase env keys");
+        return;
+      }
+
+      const accessToken = authAccessToken;
+      if (!accessToken) {
+        setUserDirectoryError("Missing auth session. Please log in again.");
+        return;
+      }
+
+      const url = `${supabaseUrl}/rest/v1/user_profiles?select=user_id,email,real_email,role,last_active&order=last_active.desc.nullslast&limit=200`;
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+
+      const res = await Promise.race([
+        fetch(url, {
+          headers: {
+            apikey: supabaseKey,
+            Authorization: `Bearer ${accessToken}`,
+            "Content-Type": "application/json",
+          },
+          signal: controller.signal,
+        }),
+        timeoutPromise,
+      ]);
+
+      if (!(res instanceof Response)) {
+        return;
+      }
+
+      clearTimeout(timeoutId);
+      if (!res.ok) {
+        const body = await res.text();
+        setUserDirectoryError(`HTTP ${res.status}: ${body.slice(0, 220)} (url: ${supabaseUrl})`);
+        return;
+      }
+      const data = await res.json();
+      const rows = Array.isArray(data) ? data : [];
+      const sorted = [...rows].sort((a, b) => {
+        const aVal = a?.last_active || 0;
+        const bVal = b?.last_active || 0;
+        const aMs = typeof aVal === "number" ? aVal : new Date(aVal).getTime() || 0;
+        const bMs = typeof bVal === "number" ? bVal : new Date(bVal).getTime() || 0;
+        return bMs - aMs;
+      });
+      setUserDirectory(sorted);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : "User directory load failed";
+      const suffix = debugUrl ? ` (url: ${debugUrl})` : "";
+      setUserDirectoryError(`${msg}${suffix}`);
+    } finally {
+      settled = true;
+      clearTimeout(safetyTimer);
+      setUserDirectoryLoading(false);
+    }
+  }
+
+  async function promoteUserToAdmin(userId) {
+    if (!isAdmin || !userId) return;
+    const { error } = await supabase
+      .from("user_profiles")
+      .update({ role: "admin" })
+      .eq("user_id", userId);
+    if (error) {
+      setToast("Role update error: " + error.message);
+      return;
+    }
+    setToast("User promoted to admin");
+    loadUserDirectory();
   }
 
 
@@ -1049,23 +1204,38 @@ export default function App() {
     const realEmail = data?.user?.user_metadata?.real_email || "";
     setCurrentUser(u);
     setCurrentName(name || u);
-    setIsAdmin(isAdminIdentity(data?.user, u));
+    const identityAdmin = isAdminIdentity(data?.user, u);
+    setIsAdmin(identityAdmin);
     setAuthIdentity({
       id: data?.user?.id || "",
       email: data?.user?.email || "",
     });
+    setAuthAccessToken(data?.session?.access_token || "");
     await upsertCurrentUserProfile(data?.user, realEmail);
+    await refreshAdminRole(data?.user?.id, identityAdmin);
     setAuthToast("Logged in");
   }
 
   async function onLogout() {
-    await supabase.auth.signOut();
+    const timeoutMs = 3000;
+    try {
+      await Promise.race([
+        supabase.auth.signOut(),
+        new Promise((_, reject) =>
+          setTimeout(() => reject(new Error("Logout request timed out")), timeoutMs)
+        ),
+      ]);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : "Logout failed";
+      setAuthToast(msg);
+    }
     setCurrentUser("");
     setCurrentName("");
     setIsAdmin(false);
     setShowAddDialog(false);
     setShowFeedbackDialog(false);
     setAuthIdentity({ id: "", email: "" });
+    setAuthAccessToken("");
     setItems([]);
     setConsumables([]);
     setFeedbackRows([]);
@@ -1088,15 +1258,18 @@ export default function App() {
       const realEmail = s.user.user_metadata?.real_email || "";
       setCurrentUser(u);
       setCurrentName(name || u);
-      setIsAdmin(isAdminIdentity(s.user, u));
+      const identityAdmin = isAdminIdentity(s.user, u);
+      setIsAdmin(identityAdmin);
       setAuthIdentity({
         id: s.user.id || "",
         email: s.user.email || "",
       });
+      setAuthAccessToken(s.access_token || "");
       upsertCurrentUserProfile(s.user, realEmail);
+      refreshAdminRole(s.user?.id, identityAdmin);
     });
 
-    const { data: sub } = supabase.auth.onAuthStateChange((_event, session) => {
+    const { data: sub } = supabase.auth.onAuthStateChange(async (_event, session) => {
       const u = session?.user?.user_metadata?.username || session?.user?.email?.split("@")?.[0] || "";
       const name =
         normalizeDisplayName(session?.user?.user_metadata?.full_name) ||
@@ -1104,12 +1277,15 @@ export default function App() {
       const realEmail = session?.user?.user_metadata?.real_email || "";
       setCurrentUser(u);
       setCurrentName(name || u);
-      setIsAdmin(isAdminIdentity(session?.user, u));
+      const identityAdmin = isAdminIdentity(session?.user, u);
+      setIsAdmin(identityAdmin);
       setAuthIdentity({
         id: session?.user?.id || "",
         email: session?.user?.email || "",
       });
+      setAuthAccessToken(session?.access_token || "");
       upsertCurrentUserProfile(session?.user, realEmail);
+      await refreshAdminRole(session?.user?.id, identityAdmin);
     });
 
     return () => sub.subscription.unsubscribe();
@@ -1193,6 +1369,17 @@ export default function App() {
           >
             Feedback
           </button>
+          {isAdmin ? (
+            <button
+              onClick={() => {
+                setActivePage("users");
+                loadUserDirectory();
+              }}
+              style={{ ...styles.tabBtn, ...(activePage === "users" ? styles.tabBtnActive : {}) }}
+            >
+              Users
+            </button>
+          ) : null}
         </div>
 
         <section style={styles.card} className="fade-up">
@@ -1382,6 +1569,19 @@ export default function App() {
             feedbackRows={feedbackRows}
             onOpenForm={() => setShowFeedbackDialog(true)}
             onToggleResolved={toggleFeedbackResolved}
+          />
+        ) : null}
+
+        {activePage === "users" && isAdmin ? (
+          <UsersPage
+            users={userDirectory}
+            isLoading={userDirectoryLoading}
+            error={userDirectoryError}
+            onRefresh={loadUserDirectory}
+            onPromote={promoteUserToAdmin}
+            roleLabelFor={profileRoleLabel}
+            displayNameFor={profileDisplayName}
+            lastActiveFor={profileLastActive}
           />
         ) : null}
 
@@ -1867,6 +2067,83 @@ function FeedbackPage({ isAdmin, feedbackRows, onOpenForm, onToggleResolved }) {
           </div>
         </section>
       )}
+    </div>
+  );
+}
+
+function UsersPage({
+  users,
+  isLoading,
+  error,
+  onRefresh,
+  onPromote,
+  roleLabelFor,
+  displayNameFor,
+  lastActiveFor,
+}) {
+  return (
+    <div style={styles.fullWidthStack}>
+      <section style={styles.card} className="fade-up">
+        <div style={styles.listTop}>
+          <div>
+            <div style={styles.cardTitle}>User directory</div>
+            <div style={styles.usersHelp}>
+              Promote users to admin to grant equipment permissions.
+            </div>
+          </div>
+          <button onClick={onRefresh} style={{ ...styles.btn, ...styles.btnGhost }}>
+            Refresh
+          </button>
+        </div>
+
+        {error ? <div style={styles.errorBox}>Load error: {error}</div> : null}
+
+        <div style={styles.usersTable}>
+          <div style={{ ...styles.usersRow, ...styles.usersHeader }}>
+            <div>Name</div>
+            <div>Last active</div>
+            <div>User ID</div>
+            <div>Role</div>
+            <div>Action</div>
+          </div>
+
+          {isLoading ? (
+            <div style={styles.empty}>Loading users…</div>
+          ) : users.length === 0 ? (
+            <div style={styles.empty}>No users found.</div>
+          ) : (
+            users.map((u) => {
+              const roleLabel = roleLabelFor(u);
+              const canPromote = roleLabel !== "Admin";
+              return (
+                <div key={u.user_id || u.id} style={styles.usersRow}>
+                  <div style={styles.usersName}>{displayNameFor(u)}</div>
+                  <div style={styles.usersMeta}>{lastActiveFor(u) || "Unknown"}</div>
+                  <div style={styles.usersMeta}>{u.user_id || "Unknown"}</div>
+                  <div>
+                    <span style={{ ...styles.rolePill, ...(roleLabel === "Admin" ? styles.roleAdmin : styles.roleUser) }}>
+                      {roleLabel}
+                    </span>
+                  </div>
+                  <div>
+                    {canPromote ? (
+                      <button
+                        type="button"
+                        onClick={() => onPromote(u.user_id)}
+                        style={{ ...styles.btnMini, ...styles.btnMiniPrimary }}
+                      >
+                        Make admin
+                      </button>
+                    ) : (
+                      <span style={styles.usersMeta}>—</span>
+                    )}
+                  </div>
+                </div>
+              );
+            })
+          )}
+        </div>
+      </section>
     </div>
   );
 }
@@ -2419,6 +2696,12 @@ const styles = {
     fontSize: 14,
     lineHeight: 1.45,
   },
+  usersHelp: {
+    color: "var(--text-soft)",
+    fontSize: 13,
+    lineHeight: 1.4,
+    marginTop: 6,
+  },
   feedbackRow: {
     padding: "12px 14px",
     borderRadius: 12,
@@ -2465,6 +2748,49 @@ const styles = {
     display: "flex",
     justifyContent: "flex-end",
     marginTop: 2,
+  },
+  usersTable: {
+    display: "flex",
+    flexDirection: "column",
+    gap: 8,
+    marginTop: 12,
+    overflowX: "auto",
+    paddingBottom: 4,
+  },
+  usersRow: {
+    display: "grid",
+    gridTemplateColumns: "minmax(160px, 1.2fr) minmax(150px, 1fr) minmax(190px, 1.4fr) 110px 120px",
+    gap: 10,
+    alignItems: "center",
+    padding: "10px 12px",
+    borderRadius: 12,
+    border: "1px solid var(--card-border)",
+    background: "var(--panel-bg)",
+    minWidth: 720,
+  },
+  usersHeader: {
+    fontSize: 12,
+    textTransform: "uppercase",
+    letterSpacing: 1.1,
+    color: "var(--text-muted)",
+    fontWeight: 700,
+    background: "var(--field-bg)",
+  },
+  usersName: {
+    fontWeight: 700,
+  },
+  usersMeta: {
+    fontSize: 12.5,
+    color: "var(--text-muted)",
+    wordBreak: "break-word",
+  },
+  errorBox: {
+    padding: "10px 12px",
+    borderRadius: 12,
+    border: "1px solid rgba(248, 113, 113, 0.4)",
+    background: "rgba(127, 29, 29, 0.24)",
+    color: "var(--text-primary)",
+    fontSize: 13,
   },
   empty: { padding: 18, opacity: 0.74, border: "1px dashed var(--dash-border)", borderRadius: 14 },
   overviewStatStack: { display: "flex", flexDirection: "column", gap: 8 },
