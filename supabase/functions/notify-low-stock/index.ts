@@ -3,8 +3,9 @@ import { createClient } from "https://esm.sh/@supabase/supabase-js@2.38.1";
 
 const supabaseUrl = Deno.env.get("SUPABASE_URL");
 const supabaseKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
-const resendKey = Deno.env.get("RESEND_API_KEY");
-const fromEmail = Deno.env.get("RESEND_FROM_EMAIL") || "alerts@inventory-vibe.local";
+const brevoKey = Deno.env.get("BREVO_API_KEY");
+const fromEmail = Deno.env.get("BREVO_FROM_EMAIL") || "alerts@inventory-vibe.local";
+const fromName = Deno.env.get("BREVO_FROM_NAME") || "Inventory Vibe";
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Headers": "authorization, x-client-info, apikey, content-type",
@@ -41,9 +42,9 @@ serve(async (req: Request) => {
   }
 
   try {
-    if (!resendKey) {
+    if (!brevoKey) {
       return new Response(
-        JSON.stringify({ error: "Missing RESEND_API_KEY in Edge Function secrets" }),
+        JSON.stringify({ error: "Missing BREVO_API_KEY in Edge Function secrets" }),
         { status: 500, headers: { ...corsHeaders, "Content-Type": "application/json" } }
       );
     }
@@ -179,24 +180,24 @@ serve(async (req: Request) => {
       </div>
     `;
 
-    // Send via Resend
-    const resendResponse = await fetch("https://api.resend.com/emails", {
+    // Send via Brevo transactional email API
+    const brevoResponse = await fetch("https://api.brevo.com/v3/smtp/email", {
       method: "POST",
       headers: {
-        Authorization: `Bearer ${resendKey}`,
+        "api-key": brevoKey,
         "Content-Type": "application/json",
       },
       body: JSON.stringify({
-        from: fromEmail,
-        to: realEmails,
+        sender: { email: fromEmail, name: fromName },
+        to: realEmails.map((email) => ({ email })),
         subject: `LOW STOCK ALERT: ${payload.name}`,
         html: htmlContent,
       }),
     });
 
-    if (!resendResponse.ok) {
-      const errorText = await resendResponse.text();
-      console.error(`Resend error: ${resendResponse.status} - ${errorText}`);
+    if (!brevoResponse.ok) {
+      const errorText = await brevoResponse.text();
+      console.error(`Brevo error: ${brevoResponse.status} - ${errorText}`);
 
       // Log failure
       await supabase.from("notification_logs").insert({
@@ -205,12 +206,12 @@ serve(async (req: Request) => {
         status: "failed",
         sent_to_emails: realEmails,
         trigger_value: payload.on_hand,
-        error_message: `Resend error: ${resendResponse.status}`,
+        error_message: `Brevo error: ${brevoResponse.status}`,
       });
 
       return new Response(
         JSON.stringify({
-          error: `Resend error: ${resendResponse.status}`,
+          error: `Brevo error: ${brevoResponse.status}`,
         }),
         { status: 500, headers: { ...corsHeaders, "Content-Type": "application/json" } }
       );

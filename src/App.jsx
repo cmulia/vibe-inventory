@@ -862,11 +862,26 @@ export default function App() {
       return;
     }
 
-    // Trigger notification if stock just went below minimum
+    // Trigger notification only when stock crosses from above min to at/below min.
     const wasAboveMin = currentOnHand > minLevel;
     const isNowBelowMin = nextOnHand <= minLevel;
+    if (delta < 0 && !isAdmin) {
+      setToast("No email trigger: you are not admin.");
+    } else if (delta < 0 && !wasAboveMin) {
+      setToast("No email trigger: item was already at/below min level.");
+    } else if (delta < 0 && wasAboveMin && !isNowBelowMin) {
+      setToast(`No email trigger: stock is still above min (${nextOnHand} > ${minLevel}).`);
+    }
+
     if (wasAboveMin && isNowBelowMin && isAdmin) {
       try {
+        const { data: sessionData, error: sessionError } = await supabase.auth.getSession();
+        const accessToken = sessionData?.session?.access_token || "";
+        if (sessionError || !accessToken) {
+          setToast("Low-stock email failed: session expired. Please log in again.");
+          return;
+        }
+
         const payload = {
           consumable_id: id,
           name: current.name || "Unknown",
@@ -878,11 +893,36 @@ export default function App() {
         };
         const { data: notifyData, error: notifyError } = await supabase.functions.invoke(
           "notify-low-stock",
-          { body: payload }
+          {
+            body: payload,
+            headers: {
+              Authorization: `Bearer ${accessToken}`,
+              apikey: import.meta.env.VITE_SUPABASE_ANON_KEY,
+            },
+          }
         );
         if (notifyError) {
           console.error("notify-low-stock invoke error:", notifyError);
-          setToast("Low-stock email trigger failed. Check Edge Function logs.");
+          let detailed = "";
+          const response = notifyError?.context;
+          if (response && typeof response.clone === "function") {
+            try {
+              const body = await response.clone().json();
+              detailed = String(body?.error || body?.message || "");
+            } catch {
+              try {
+                detailed = String(await response.clone().text());
+              } catch {
+                detailed = "";
+              }
+            }
+          }
+          const msg = detailed
+            ? `Low-stock email failed: ${detailed}`
+            : notifyError.message
+              ? `Low-stock email failed: ${notifyError.message}`
+              : "Low-stock email trigger failed. Check Edge Function logs.";
+          setToast(msg.slice(0, 220));
         } else {
           console.log("notify-low-stock response data:", notifyData);
           if (notifyData?.message) setToast(notifyData.message);
