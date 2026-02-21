@@ -298,13 +298,21 @@ export default function App() {
   const [addDebug, setAddDebug] = useState("");
   const fileRef = useRef(null);
 
-  // load inventory when user changes
+  // Load data once user identity is ready. Including authIdentity helps avoid
+  // an empty first load during session rehydration after refresh.
   useEffect(() => {
     if (!currentUser) return;
     loadInventoryFromDb();
     loadConsumablesFromDb();
     loadFeedbacksFromDb();
-  }, [currentUser]);
+  }, [currentUser, authIdentity.id]);
+
+  // Always refresh consumables when navigating to the consumables tab.
+  useEffect(() => {
+    if (!currentUser) return;
+    if (activePage !== "consumables") return;
+    loadConsumablesFromDb();
+  }, [activePage, currentUser, authIdentity.id]);
 
 
   // persist inventory when items change
@@ -424,21 +432,7 @@ export default function App() {
 }
 
   async function loadConsumablesFromDb() {
-    let data = null;
-    let error = null;
-    const ordered = await supabase
-      .from("consumables_items")
-      .select("*")
-      .order("created_at", { ascending: true });
-    data = ordered.data;
-    error = ordered.error;
-
-    // Some rebuilt tables may not include created_at; fall back to plain select.
-    if (error) {
-      const fallback = await supabase.from("consumables_items").select("*");
-      data = fallback.data;
-      error = fallback.error;
-    }
+    const { data, error } = await supabase.from("consumables_items").select("*");
 
     if (error) {
       setToast("Consumables load error: " + error.message);
