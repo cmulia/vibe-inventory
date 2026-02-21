@@ -115,9 +115,9 @@ async function loadProfileMapForActorIds(actorIds) {
 }
 
 async function upsertCurrentUserProfile(user, realEmail = "") {
-  if (!user?.id) return;
+  if (!user?.id) return { ok: false, error: "No authenticated user id" };
   const email = realEmail || user?.user_metadata?.real_email || user?.email || "";
-  await supabase.from("user_profiles").upsert(
+  const { error } = await supabase.from("user_profiles").upsert(
     {
       user_id: user.id,
       email: user.email || "",
@@ -126,6 +126,8 @@ async function upsertCurrentUserProfile(user, realEmail = "") {
     },
     { onConflict: "user_id" }
   );
+  if (error) return { ok: false, error: error.message };
+  return { ok: true, error: "" };
 }
 
 function fmtTime(ms) {
@@ -422,10 +424,21 @@ export default function App() {
 }
 
   async function loadConsumablesFromDb() {
-    const { data, error } = await supabase
+    let data = null;
+    let error = null;
+    const ordered = await supabase
       .from("consumables_items")
       .select("*")
       .order("created_at", { ascending: true });
+    data = ordered.data;
+    error = ordered.error;
+
+    // Some rebuilt tables may not include created_at; fall back to plain select.
+    if (error) {
+      const fallback = await supabase.from("consumables_items").select("*");
+      data = fallback.data;
+      error = fallback.error;
+    }
 
     if (error) {
       setToast("Consumables load error: " + error.message);
@@ -458,15 +471,19 @@ export default function App() {
 
     const mapped = (rows || []).map((r) => ({
       id: String(r.id),
-      name: String(r.name || ""),
-      category: String(r.category || ""),
-      unit: String(r.unit || "pcs"),
+      name: String(r.name ?? r.item_name ?? ""),
+      category: String(r.category ?? ""),
+      unit: String(r.unit ?? "pcs"),
       location: String(r.location || CONSUMABLE_LOCATIONS[0]),
-      onHand: Number(r.on_hand || 0) || 0,
-      minLevel: Number(r.min_level || 0) || 0,
-      changedByName: String(r.updated_by_name || ""),
-      changedByUsername: String(r.updated_by_username || ""),
-      updatedAt: r.updated_at ? new Date(r.updated_at).getTime() : Date.now(),
+      onHand: Number(r.on_hand ?? r.onHand ?? 0) || 0,
+      minLevel: Number(r.min_level ?? r.minLevel ?? 0) || 0,
+      changedByName: String(r.updated_by_name ?? r.updatedByName ?? ""),
+      changedByUsername: String(r.updated_by_username ?? r.updatedByUsername ?? ""),
+      updatedAt: r.updated_at
+        ? new Date(r.updated_at).getTime()
+        : r.created_at
+          ? new Date(r.created_at).getTime()
+          : Date.now(),
     }));
 
     setConsumables(mapped);
@@ -1017,14 +1034,7 @@ export default function App() {
     setConsumables((prev) => [optimistic, ...prev.filter((x) => x.id !== id)]);
 
     try {
-      const timeoutMs = 8000;
-      const timeoutPromise = new Promise((_, reject) =>
-        setTimeout(() => reject(new Error("Insert timed out")), timeoutMs)
-      );
-      const { error } = await Promise.race([
-        supabase.from("consumables_items").insert([row], { returning: "minimal" }),
-        timeoutPromise,
-      ]);
+      const { error } = await supabase.from("consumables_items").insert([row], { returning: "minimal" });
       if (error) {
         setConsumables((prev) => prev.filter((x) => x.id !== id));
         setToast("Consumable add error: " + error.message);
@@ -1037,9 +1047,12 @@ export default function App() {
       loadConsumablesFromDb();
       return true;
     } catch (err) {
-      setConsumables((prev) => prev.filter((x) => x.id !== id));
       const msg = err instanceof Error ? err.message : "Consumable add failed";
-      setToast("Consumable add error: " + msg);
+      setToast("Consumable add delayed sync: " + msg);
+      // Keep optimistic item visible and try background reload.
+      setTimeout(() => {
+        loadConsumablesFromDb();
+      }, 1500);
       return false;
     }
   }
@@ -1210,7 +1223,7 @@ export default function App() {
       setAuthToast("Invalid username format");
       return;
     }
-    const { error } = await supabase.auth.signUp({
+    const { data, error } = await supabase.auth.signUp({
       email,
       password,
       options: { data: { username, full_name: name, real_email: emailRaw } },
@@ -1221,7 +1234,16 @@ export default function App() {
       return;
     }
 
-    setAuthToast("Signed up. Now log in.");
+    // If signup also returns a live session, write profile immediately.
+    if (data?.session?.user) {
+      const profileResult = await upsertCurrentUserProfile(data.session.user, emailRaw);
+      if (!profileResult.ok) {
+        setAuthToast(`Signed up, but profile sync failed: ${profileResult.error}`);
+        return;
+      }
+    }
+
+    setAuthToast("Signed up. If email verification is enabled, verify email, then log in once.");
   }
 
   async function onLogin(usernameRaw, password) {
@@ -1259,24 +1281,16 @@ export default function App() {
       email: data?.user?.email || "",
     });
     setAuthAccessToken(data?.session?.access_token || "");
-    await upsertCurrentUserProfile(data?.user, realEmail);
+    const profileResult = await upsertCurrentUserProfile(data?.user, realEmail);
+    if (!profileResult.ok) {
+      setAuthToast(`Profile sync failed: ${profileResult.error}`);
+    }
     await refreshAdminRole(data?.user?.id, identityAdmin);
     setAuthToast("Logged in");
   }
 
   async function onLogout() {
     const timeoutMs = 3000;
-    try {
-      await Promise.race([
-        supabase.auth.signOut(),
-        new Promise((_, reject) =>
-          setTimeout(() => reject(new Error("Logout request timed out")), timeoutMs)
-        ),
-      ]);
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : "Logout failed";
-      setAuthToast(msg);
-    }
     setCurrentUser("");
     setCurrentName("");
     setIsAdmin(false);
@@ -1292,6 +1306,18 @@ export default function App() {
     setSort("recent");
     setToast("");
     setAuthToast("Logged out");
+
+    try {
+      await Promise.race([
+        supabase.auth.signOut(),
+        new Promise((_, reject) =>
+          setTimeout(() => reject(new Error("Logout request timed out")), timeoutMs)
+        ),
+      ]);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : "Logout failed";
+      setAuthToast(`Logged out locally (${msg})`);
+    }
   }
 
   useEffect(() => {
@@ -1313,7 +1339,9 @@ export default function App() {
         email: s.user.email || "",
       });
       setAuthAccessToken(s.access_token || "");
-      upsertCurrentUserProfile(s.user, realEmail);
+      upsertCurrentUserProfile(s.user, realEmail).then((res) => {
+        if (!res?.ok) setAuthToast(`Profile sync failed: ${res.error}`);
+      });
       refreshAdminRole(s.user?.id, identityAdmin);
     });
 
@@ -1332,7 +1360,10 @@ export default function App() {
         email: session?.user?.email || "",
       });
       setAuthAccessToken(session?.access_token || "");
-      upsertCurrentUserProfile(session?.user, realEmail);
+      const profileResult = await upsertCurrentUserProfile(session?.user, realEmail);
+      if (!profileResult.ok && session?.user?.id) {
+        setAuthToast(`Profile sync failed: ${profileResult.error}`);
+      }
       await refreshAdminRole(session?.user?.id, identityAdmin);
     });
 
@@ -1882,7 +1913,8 @@ function OverviewPage({ consumableStats, consumables, isAdmin, onLowStockSelect 
 }
 
 function ConsumablesPage({ consumables, isAdmin, onAdd, onAdjust, onDelete, onNoPrivilege, jumpTarget }) {
-  const [locationFilter, setLocationFilter] = useState(CONSUMABLE_LOCATIONS[0]);
+  const ALL_LOCATIONS = "__all__";
+  const [locationFilter, setLocationFilter] = useState(ALL_LOCATIONS);
   const [showAddConsumable, setShowAddConsumable] = useState(false);
 
   function consumableEmoji(row) {
@@ -1897,13 +1929,24 @@ function ConsumablesPage({ consumables, isAdmin, onAdd, onAdjust, onDelete, onNo
     return "📦";
   }
 
-  const filteredConsumables = locationFilter
-    ? consumables.filter((c) => String(c.location || "") === locationFilter)
-    : [];
+  const locationOptions = useMemo(() => {
+    const set = new Set(CONSUMABLE_LOCATIONS);
+    for (const item of consumables) {
+      const loc = String(item?.location || "").trim();
+      if (loc) set.add(loc);
+    }
+    return [ALL_LOCATIONS, ...Array.from(set)];
+  }, [consumables]);
+
+  const filteredConsumables = useMemo(() => {
+    if (locationFilter === ALL_LOCATIONS) return consumables;
+    const wanted = String(locationFilter || "").trim().toLowerCase();
+    return consumables.filter((c) => String(c.location || "").trim().toLowerCase() === wanted);
+  }, [consumables, locationFilter]);
 
   useEffect(() => {
     if (!jumpTarget?.id) return;
-    if (jumpTarget.location) setLocationFilter(jumpTarget.location);
+    if (jumpTarget.location) setLocationFilter(String(jumpTarget.location));
   }, [jumpTarget?.at]);
 
   useEffect(() => {
@@ -1941,13 +1984,13 @@ function ConsumablesPage({ consumables, isAdmin, onAdd, onAdjust, onDelete, onNo
             <div style={styles.locationFilterBlock}>
               <div style={styles.locationLabel}>Choose a location</div>
               <div style={styles.locationButtonRow}>
-                {CONSUMABLE_LOCATIONS.map((loc) => (
+                {locationOptions.map((loc) => (
                   <button
                     key={loc}
                     onClick={() => setLocationFilter(loc)}
                     style={{ ...styles.locationBtn, ...(locationFilter === loc ? styles.locationBtnActive : {}) }}
                   >
-                    {loc}
+                    {loc === ALL_LOCATIONS ? "All" : loc}
                   </button>
                 ))}
               </div>
@@ -1960,7 +2003,7 @@ function ConsumablesPage({ consumables, isAdmin, onAdd, onAdjust, onDelete, onNo
 
         {filteredConsumables.length === 0 ? (
           <div style={styles.empty}>
-            {locationFilter ? "No consumables in this location yet." : "Choose a location to view consumables."}
+            {locationFilter === ALL_LOCATIONS ? "No consumables yet." : "No consumables in this location yet."}
           </div>
         ) : (
           <div style={styles.consumableGallery} className="consumable-gallery">
