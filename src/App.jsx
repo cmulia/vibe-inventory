@@ -1,5 +1,5 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
-import { supabase } from "./supabase";
+import { SUPABASE_CONFIG_ERROR, supabase } from "./supabase";
 
 
 const USERS_KEY = "vibe_users_v1"; // registered users
@@ -246,6 +246,21 @@ function loadConsumables() {
 
 
 export default function App() {
+  if (SUPABASE_CONFIG_ERROR) {
+    return (
+      <main style={{ padding: "2rem", fontFamily: "ui-sans-serif, system-ui, sans-serif" }}>
+        <h1>App configuration error</h1>
+        <p>Supabase environment variables are not configured for this deployment.</p>
+        <pre style={{ whiteSpace: "pre-wrap", background: "#111", color: "#fff", padding: "0.75rem" }}>
+          {SUPABASE_CONFIG_ERROR}
+        </pre>
+        <p>
+          In Vercel, set <code>VITE_SUPABASE_URL</code> and <code>VITE_SUPABASE_ANON_KEY</code>, then redeploy.
+        </p>
+      </main>
+    );
+  }
+
   const [currentUser, setCurrentUser] = useState("");
   const [currentName, setCurrentName] = useState("");
   const [isAdmin, setIsAdmin] = useState(false);
@@ -973,9 +988,11 @@ export default function App() {
     const location = String(fd.get("location") || "").trim() || CONSUMABLE_LOCATIONS[0];
     const onHand = Number(fd.get("onHand") || 0) || 0;
     const minLevel = Number(fd.get("minLevel") || 0) || 0;
+    const now = Date.now();
+    const id = genUuid();
 
     const row = {
-      id: genUuid(),
+      id,
       name,
       category,
       unit,
@@ -985,15 +1002,46 @@ export default function App() {
       updated_by_name: currentName || currentUser || "Unknown",
       updated_by_username: currentUser || "unknown",
     };
-    const { error } = await supabase.from("consumables_items").insert([row], { returning: "minimal" });
-    if (error) {
-      setToast("Consumable add error: " + error.message);
+    const optimistic = {
+      id,
+      name,
+      category,
+      unit,
+      location,
+      onHand,
+      minLevel,
+      changedByName: currentName || currentUser || "Unknown",
+      changedByUsername: currentUser || "unknown",
+      updatedAt: now,
+    };
+    setConsumables((prev) => [optimistic, ...prev.filter((x) => x.id !== id)]);
+
+    try {
+      const timeoutMs = 8000;
+      const timeoutPromise = new Promise((_, reject) =>
+        setTimeout(() => reject(new Error("Insert timed out")), timeoutMs)
+      );
+      const { error } = await Promise.race([
+        supabase.from("consumables_items").insert([row], { returning: "minimal" }),
+        timeoutPromise,
+      ]);
+      if (error) {
+        setConsumables((prev) => prev.filter((x) => x.id !== id));
+        setToast("Consumable add error: " + error.message);
+        return false;
+      }
+
+      e.currentTarget.reset();
+      setToast("Consumable added");
+      // Sync canonical values in background; keep optimistic row visible even if this hangs.
+      loadConsumablesFromDb();
+      return true;
+    } catch (err) {
+      setConsumables((prev) => prev.filter((x) => x.id !== id));
+      const msg = err instanceof Error ? err.message : "Consumable add failed";
+      setToast("Consumable add error: " + msg);
       return false;
     }
-    await loadConsumablesFromDb();
-    e.currentTarget.reset();
-    setToast("Consumable added");
-    return true;
   }
 
   async function adjustConsumable(id, delta) {
@@ -1834,7 +1882,7 @@ function OverviewPage({ consumableStats, consumables, isAdmin, onLowStockSelect 
 }
 
 function ConsumablesPage({ consumables, isAdmin, onAdd, onAdjust, onDelete, onNoPrivilege, jumpTarget }) {
-  const [locationFilter, setLocationFilter] = useState("");
+  const [locationFilter, setLocationFilter] = useState(CONSUMABLE_LOCATIONS[0]);
   const [showAddConsumable, setShowAddConsumable] = useState(false);
 
   function consumableEmoji(row) {
@@ -1875,8 +1923,13 @@ function ConsumablesPage({ consumables, isAdmin, onAdd, onAdjust, onDelete, onNo
   }
 
   async function submitAddConsumable(e) {
+    const formData = new FormData(e.currentTarget);
+    const selectedLocation = String(formData.get("location") || "").trim() || CONSUMABLE_LOCATIONS[0];
     const ok = await onAdd(e);
-    if (ok) setShowAddConsumable(false);
+    if (ok) {
+      setLocationFilter(selectedLocation);
+      setShowAddConsumable(false);
+    }
   }
 
   return (
