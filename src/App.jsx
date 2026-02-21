@@ -432,14 +432,39 @@ export default function App() {
 }
 
   async function loadConsumablesFromDb() {
-    const { data, error } = await supabase.from("consumables_items").select("*");
+    try {
+      const supabaseUrl = import.meta.env.VITE_SUPABASE_URL;
+      const supabaseKey = import.meta.env.VITE_SUPABASE_ANON_KEY;
+      if (!supabaseUrl || !supabaseKey) {
+        setToast("Consumables load error: missing Supabase env keys");
+        return;
+      }
 
-    if (error) {
-      setToast("Consumables load error: " + error.message);
-      return;
-    }
+      const { data: sessionData, error: sessionError } = await supabase.auth.getSession();
+      const accessToken = sessionData?.session?.access_token || "";
+      if (sessionError || !accessToken) {
+        setConsumables([]);
+        setToast("Consumables load error: missing auth session. Please log in again.");
+        return;
+      }
 
-    const rows = data || [];
+      const url = `${supabaseUrl}/rest/v1/consumables_items?select=*`;
+      const res = await fetch(url, {
+        headers: {
+          apikey: supabaseKey,
+          Authorization: `Bearer ${accessToken}`,
+          "Content-Type": "application/json",
+        },
+      });
+      if (!res.ok) {
+        const body = await res.text();
+        setToast(`Consumables load error: HTTP ${res.status} ${body.slice(0, 140)}`);
+        return;
+      }
+
+      const payload = await res.json();
+      const rows = Array.isArray(payload) ? payload : [];
+
     if (rows.length === 0) {
       const legacy = loadConsumables();
       if (legacy.length > 0) {
@@ -481,6 +506,10 @@ export default function App() {
     }));
 
     setConsumables(mapped);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : "Unknown error";
+      setToast("Consumables load error: " + msg);
+    }
   }
 
   async function loadFeedbacksFromDb() {
