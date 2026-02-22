@@ -77,7 +77,10 @@ async function fetchTableRowsWithAuth(tableName, accessToken, timeoutMs = 8000) 
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
-    const url = `${supabaseUrl}/rest/v1/${tableName}?select=*`;
+    const hasQuery = String(tableName).includes("?");
+    const url = hasQuery
+      ? `${supabaseUrl}/rest/v1/${tableName}`
+      : `${supabaseUrl}/rest/v1/${tableName}?select=*`;
     const res = await fetch(url, {
       headers: {
         apikey: supabaseKey,
@@ -140,6 +143,44 @@ async function mutateTableWithAuth(tableName, method, accessToken, options = {})
       return Array.isArray(payload) ? payload : [];
     }
     return true;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function callRpcWithAuth(functionName, accessToken, args = {}, timeoutMs = 8000) {
+  const supabaseUrl = import.meta.env.VITE_SUPABASE_URL;
+  const supabaseKey = import.meta.env.VITE_SUPABASE_ANON_KEY;
+  if (!supabaseUrl || !supabaseKey) {
+    throw new Error("Missing Supabase env keys");
+  }
+  if (!accessToken) {
+    throw new Error("Missing auth access token");
+  }
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const url = `${supabaseUrl}/rest/v1/rpc/${functionName}`;
+    const res = await fetch(url, {
+      method: "POST",
+      headers: {
+        apikey: supabaseKey,
+        Authorization: `Bearer ${accessToken}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(args),
+      signal: controller.signal,
+    });
+    if (!res.ok) {
+      const text = await res.text();
+      throw new Error(`HTTP ${res.status} ${text.slice(0, 220)}`);
+    }
+    try {
+      return await res.json();
+    } catch {
+      return null;
+    }
   } finally {
     clearTimeout(timer);
   }
@@ -373,7 +414,7 @@ export default function App() {
   const [isAdmin, setIsAdmin] = useState(false);
   const [theme, setTheme] = useState(() => localStorage.getItem(THEME_KEY) || "dark");
   const [activePage, setActivePage] = useState("consumables"); // overview | equipment | consumables | feedback
-  const [authIdentity, setAuthIdentity] = useState({ id: "", email: "" });
+  const [authIdentity, setAuthIdentity] = useState({ id: "", email: "", realEmail: "" });
   const [authAccessToken, setAuthAccessToken] = useState("");
 
   const [authToast, setAuthToast] = useState("");
@@ -676,16 +717,98 @@ export default function App() {
     if (error) return;
   }
 
-  async function refreshAdminRole(userId, identityAdmin) {
+  async function refreshAdminRole(
+    userId,
+    identityAdmin,
+    identityEmail = "",
+    identityRealEmail = "",
+    explicitAccessToken = "",
+    identityUsername = ""
+  ) {
     if (!userId) return;
-    const { data, error } = await supabase
-      .from("user_profiles")
-      .select("role")
-      .eq("user_id", userId)
-      .maybeSingle();
-    if (error) return;
-    const profileAdmin = String(data?.role || "").toLowerCase() === "admin";
-    setIsAdmin(identityAdmin || profileAdmin);
+    try {
+      let accessToken = explicitAccessToken || authAccessToken;
+      if (!accessToken) {
+        const { data: sessionData } = await supabase.auth.getSession();
+        accessToken = sessionData?.session?.access_token || "";
+      }
+      if (!accessToken) {
+        setIsAdmin(!!identityAdmin);
+        return;
+      }
+
+      // Prefer backend-authoritative admin check when RPC is available.
+      try {
+        const rpcAdmin = await callRpcWithAuth("is_current_user_admin", accessToken, {}, 8000);
+        const rpcValue =
+          typeof rpcAdmin === "boolean"
+            ? rpcAdmin
+            : typeof rpcAdmin === "object" && rpcAdmin !== null
+              ? Boolean(rpcAdmin?.is_admin ?? rpcAdmin?.result)
+              : false;
+        if (rpcValue) {
+          setIsAdmin(true);
+          return;
+        }
+      } catch {
+        // RPC may not exist yet; fall through to client-side fallback checks.
+      }
+
+      const rows = await fetchTableRowsWithAuth(
+        `user_profiles?select=role&user_id=eq.${encodeURIComponent(String(userId))}`,
+        accessToken,
+        8000
+      );
+      let profileAdmin = Array.isArray(rows)
+        ? rows.some((r) => String(r?.role || "").toLowerCase() === "admin")
+        : false;
+
+      // Fallback/self-heal: if profile was recreated with a different user_id,
+      // preserve admin role by matching the current auth email.
+      const authEmail = String(identityEmail || authIdentity?.email || "");
+      const authRealEmail = String(identityRealEmail || authIdentity?.realEmail || "");
+      const authUsername = normalizeUsername(identityUsername || "");
+      if (!profileAdmin && (authEmail || authRealEmail)) {
+        const orParts = [];
+        if (authEmail) {
+          orParts.push(`email.eq.${encodeURIComponent(authEmail)}`);
+        }
+        if (authRealEmail) {
+          orParts.push(`real_email.eq.${encodeURIComponent(authRealEmail)}`);
+        }
+        if (authUsername) {
+          const syntheticEmail = `${authUsername}@vibe-user.example.com`;
+          orParts.push(`email.eq.${encodeURIComponent(syntheticEmail)}`);
+        }
+        const byEmail = await fetchTableRowsWithAuth(
+          `user_profiles?select=role,user_id,email,real_email&or=(${orParts.join(",")})`,
+          accessToken,
+          8000
+        );
+        const emailAdmin = Array.isArray(byEmail)
+          ? byEmail.some((r) => String(r?.role || "").toLowerCase() === "admin")
+          : false;
+        if (emailAdmin) {
+          profileAdmin = true;
+          const matchedUserId = String((byEmail || []).find((r) => String(r?.role || "").toLowerCase() === "admin")?.user_id || "");
+          if (matchedUserId && matchedUserId !== String(userId)) {
+            try {
+              await mutateTableWithAuth("user_profiles", "PATCH", accessToken, {
+                filter: { user_id: userId },
+                body: { role: "admin" },
+                timeoutMs: 8000,
+              });
+            } catch {
+              // ignore sync failures; still elevate locally from trusted profile match
+            }
+          }
+        }
+      }
+
+      setIsAdmin(identityAdmin || profileAdmin);
+    } catch {
+      setIsAdmin(!!identityAdmin);
+    }
   }
 
   async function loadUserDirectory() {
@@ -767,18 +890,78 @@ export default function App() {
     }
   }
 
-  async function promoteUserToAdmin(userId) {
-    if (!isAdmin || !userId) return;
-    try {
-      const accessToken = await getAccessTokenOrThrow();
+  async function applyRoleToMatchingProfiles(accessToken, { userId, email, realEmail, role }) {
+    const clauses = [];
+    if (userId) clauses.push(`user_id.eq.${encodeURIComponent(userId)}`);
+    if (email) clauses.push(`email.eq.${encodeURIComponent(email)}`);
+    if (realEmail) clauses.push(`real_email.eq.${encodeURIComponent(realEmail)}`);
+
+    let rows = [];
+    if (clauses.length > 0) {
+      rows = await fetchTableRowsWithAuth(
+        `user_profiles?select=user_id&or=(${clauses.join(",")})&limit=500`,
+        accessToken,
+        8000
+      );
+    }
+
+    const ids = new Set(
+      (Array.isArray(rows) ? rows : [])
+        .map((r) => String(r?.user_id || ""))
+        .filter(Boolean)
+    );
+    if (userId) ids.add(userId);
+
+    let changed = 0;
+    for (const id of ids) {
       const updated = await mutateTableWithAuth("user_profiles", "PATCH", accessToken, {
-        filter: { user_id: userId },
-        body: { role: "admin" },
+        filter: { user_id: id },
+        body: { role },
         timeoutMs: 8000,
         returning: "representation",
       });
-      if (!Array.isArray(updated) || updated.length === 0) {
-        setToast("Role update blocked (RLS policy). Ask admin to allow role updates.");
+      if (Array.isArray(updated) && updated.length > 0) changed += updated.length;
+    }
+
+    if (changed === 0 && role === "admin" && userId) {
+      try {
+        const inserted = await mutateTableWithAuth("user_profiles", "POST", accessToken, {
+          body: [
+            {
+              user_id: userId,
+              email: email || "",
+              real_email: realEmail || "",
+              role: "admin",
+              email_verified: false,
+            },
+          ],
+          timeoutMs: 8000,
+          returning: "representation",
+        });
+        if (Array.isArray(inserted) && inserted.length > 0) changed += inserted.length;
+      } catch {
+        // no-op; caller handles unchanged result
+      }
+    }
+
+    return changed;
+  }
+
+  async function setUserRole(target, nextRole) {
+    const userId = String(target?.user_id || target?.id || "");
+    const email = String(target?.email || "");
+    const realEmail = String(target?.real_email || "");
+    if (!isAdmin || (!userId && !email && !realEmail)) return;
+    try {
+      const accessToken = await getAccessTokenOrThrow();
+      const changedCount = await applyRoleToMatchingProfiles(accessToken, {
+        userId,
+        email,
+        realEmail,
+        role: nextRole,
+      });
+      if (changedCount <= 0) {
+        setToast("Role update blocked (RLS policy) or no matching profile rows found.");
         return;
       }
     } catch (err) {
@@ -787,10 +970,65 @@ export default function App() {
       return;
     }
     setUserDirectory((prev) =>
-      prev.map((u) => (String(u.user_id || "") === String(userId) ? { ...u, role: "admin" } : u))
+      prev.map((u) => {
+        const sameId = userId && String(u.user_id || "") === userId;
+        const sameEmail = email && String(u.email || "") === email;
+        const sameRealEmail = realEmail && String(u.real_email || "") === realEmail;
+        return sameId || sameEmail || sameRealEmail ? { ...u, role: nextRole } : u;
+      })
     );
-    setToast("User promoted to admin");
+    if (
+      (userId && String(authIdentity.id || "") === userId) ||
+      (email && String(authIdentity.email || "") === email) ||
+      (realEmail && String(authIdentity.realEmail || "") === realEmail)
+    ) {
+      setIsAdmin(nextRole === "admin");
+    }
+    setToast(nextRole === "admin" ? "User promoted to admin" : "User demoted to user");
     loadUserDirectory();
+  }
+
+  async function promoteUserToAdmin(target) {
+    return setUserRole(target, "admin");
+  }
+
+  async function demoteUserToUser(target) {
+    return setUserRole(target, "user");
+  }
+
+  async function refreshNonAdminAccounts() {
+    if (!isAdmin) return;
+    setUserDirectoryLoading(true);
+    try {
+      const accessToken = await getAccessTokenOrThrow();
+      const rows = await fetchTableRowsWithAuth(
+        "user_profiles?select=user_id,role,email,real_email&limit=500",
+        accessToken,
+        8000
+      );
+      const nonAdmins = (Array.isArray(rows) ? rows : []).filter(
+        (u) => String(u?.role || "").toLowerCase() !== "admin"
+      );
+
+      let touched = 0;
+      for (const row of nonAdmins) {
+        const id = String(row?.user_id || "");
+        if (!id) continue;
+        await mutateTableWithAuth("user_profiles", "PATCH", accessToken, {
+          filter: { user_id: id },
+          body: { role: "user" },
+          timeoutMs: 8000,
+        });
+        touched += 1;
+      }
+
+      setToast(`Refreshed ${touched} non-admin account${touched === 1 ? "" : "s"}.`);
+      await loadUserDirectory();
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : "Refresh failed";
+      setToast("Refresh non-admin error: " + msg);
+      setUserDirectoryLoading(false);
+    }
   }
 
 
@@ -1451,13 +1689,21 @@ export default function App() {
     setAuthIdentity({
       id: data?.user?.id || "",
       email: data?.user?.email || "",
+      realEmail: realEmail || "",
     });
     setAuthAccessToken(data?.session?.access_token || "");
     const profileResult = await upsertCurrentUserProfile(data?.user, realEmail);
     if (!profileResult.ok) {
       setAuthToast(`Profile sync failed: ${profileResult.error}`);
     }
-    await refreshAdminRole(data?.user?.id, identityAdmin);
+    await refreshAdminRole(
+      data?.user?.id,
+      identityAdmin,
+      data?.user?.email || "",
+      realEmail,
+      data?.session?.access_token || "",
+      u
+    );
     setAuthToast("Logged in");
   }
 
@@ -1468,7 +1714,7 @@ export default function App() {
     setIsAdmin(false);
     setShowAddDialog(false);
     setShowFeedbackDialog(false);
-    setAuthIdentity({ id: "", email: "" });
+    setAuthIdentity({ id: "", email: "", realEmail: "" });
     setAuthAccessToken("");
     setItems([]);
     setConsumables([]);
@@ -1487,8 +1733,8 @@ export default function App() {
         ),
       ]);
     } catch (err) {
-      const msg = err instanceof Error ? err.message : "Logout failed";
-      setAuthToast(`Logged out locally (${msg})`);
+      // UI is already logged out locally; avoid noisy timeout warnings.
+      setAuthToast("Logged out");
     }
   }
 
@@ -1509,12 +1755,20 @@ export default function App() {
       setAuthIdentity({
         id: s.user.id || "",
         email: s.user.email || "",
+        realEmail: realEmail || "",
       });
       setAuthAccessToken(s.access_token || "");
       upsertCurrentUserProfile(s.user, realEmail).then((res) => {
         if (!res?.ok) setAuthToast(`Profile sync failed: ${res.error}`);
       });
-      refreshAdminRole(s.user?.id, identityAdmin);
+      refreshAdminRole(
+        s.user?.id,
+        identityAdmin,
+        s.user?.email || "",
+        realEmail,
+        s.access_token || "",
+        u
+      );
       loadInventoryFromDb();
       loadConsumablesFromDb();
       loadFeedbacksFromDb();
@@ -1533,13 +1787,21 @@ export default function App() {
       setAuthIdentity({
         id: session?.user?.id || "",
         email: session?.user?.email || "",
+        realEmail: realEmail || "",
       });
       setAuthAccessToken(session?.access_token || "");
       const profileResult = await upsertCurrentUserProfile(session?.user, realEmail);
       if (!profileResult.ok && session?.user?.id) {
         setAuthToast(`Profile sync failed: ${profileResult.error}`);
       }
-      await refreshAdminRole(session?.user?.id, identityAdmin);
+      await refreshAdminRole(
+        session?.user?.id,
+        identityAdmin,
+        session?.user?.email || "",
+        realEmail,
+        session?.access_token || "",
+        u
+      );
       if (session?.user?.id) {
         loadInventoryFromDb();
         loadConsumablesFromDb();
@@ -1842,7 +2104,9 @@ export default function App() {
             isLoading={userDirectoryLoading}
             error={userDirectoryError}
             onRefresh={loadUserDirectory}
+            onRefreshNonAdmin={refreshNonAdminAccounts}
             onPromote={promoteUserToAdmin}
+            onDemote={demoteUserToUser}
             roleLabelFor={profileRoleLabel}
             displayNameFor={profileDisplayName}
             lastActiveFor={profileLastActive}
@@ -2357,11 +2621,16 @@ function UsersPage({
   isLoading,
   error,
   onRefresh,
+  onRefreshNonAdmin,
   onPromote,
+  onDemote,
   roleLabelFor,
   displayNameFor,
   lastActiveFor,
 }) {
+  const adminCount = users.filter((u) => roleLabelFor(u) === "Admin").length;
+  const userCount = Math.max(0, users.length - adminCount);
+
   return (
     <div style={styles.fullWidthStack}>
       <section style={styles.card} className="fade-up">
@@ -2372,9 +2641,29 @@ function UsersPage({
               Promote users to admin to grant equipment permissions.
             </div>
           </div>
-          <button onClick={onRefresh} style={{ ...styles.btn, ...styles.btnGhost }}>
-            Refresh
-          </button>
+          <div style={styles.usersToolbar}>
+            <button onClick={onRefresh} style={{ ...styles.btn, ...styles.btnGhost }}>
+              Refresh
+            </button>
+            <button onClick={onRefreshNonAdmin} style={{ ...styles.btn, ...styles.btnGhost }}>
+              Refresh Non-admin
+            </button>
+          </div>
+        </div>
+
+        <div style={styles.usersSummaryRow}>
+          <div style={styles.usersSummaryCard}>
+            <div style={styles.usersSummaryLabel}>Total</div>
+            <div style={styles.usersSummaryValue}>{users.length}</div>
+          </div>
+          <div style={styles.usersSummaryCard}>
+            <div style={styles.usersSummaryLabel}>Admins</div>
+            <div style={styles.usersSummaryValue}>{adminCount}</div>
+          </div>
+          <div style={styles.usersSummaryCard}>
+            <div style={styles.usersSummaryLabel}>Users</div>
+            <div style={styles.usersSummaryValue}>{userCount}</div>
+          </div>
         </div>
 
         {error ? <div style={styles.errorBox}>Load error: {error}</div> : null}
@@ -2383,6 +2672,8 @@ function UsersPage({
           <div style={{ ...styles.usersRow, ...styles.usersHeader }}>
             <div>Name</div>
             <div>Last active</div>
+            <div>Auth Email</div>
+            <div>Real Email</div>
             <div>User ID</div>
             <div>Role</div>
             <div>Action</div>
@@ -2395,11 +2686,13 @@ function UsersPage({
           ) : (
             users.map((u) => {
               const roleLabel = roleLabelFor(u);
-              const canPromote = roleLabel !== "Admin";
+              const isAdminRole = roleLabel === "Admin";
               return (
                 <div key={u.user_id || u.id} style={styles.usersRow}>
                   <div style={styles.usersName}>{displayNameFor(u)}</div>
                   <div style={styles.usersMeta}>{lastActiveFor(u) || "Unknown"}</div>
+                  <div style={styles.usersMeta}>{u.email || "Unknown"}</div>
+                  <div style={styles.usersMeta}>{u.real_email || "Unknown"}</div>
                   <div style={styles.usersMeta}>{u.user_id || "Unknown"}</div>
                   <div>
                     <span style={{ ...styles.rolePill, ...(roleLabel === "Admin" ? styles.roleAdmin : styles.roleUser) }}>
@@ -2407,16 +2700,22 @@ function UsersPage({
                     </span>
                   </div>
                   <div>
-                    {canPromote ? (
+                    {!isAdminRole ? (
                       <button
                         type="button"
-                        onClick={() => onPromote(u.user_id)}
+                        onClick={() => onPromote(u)}
                         style={{ ...styles.btnMini, ...styles.btnMiniPrimary }}
                       >
                         Make admin
                       </button>
                     ) : (
-                      <span style={styles.usersMeta}>—</span>
+                      <button
+                        type="button"
+                        onClick={() => onDemote(u)}
+                        style={{ ...styles.btnMini, ...styles.btnMiniDanger }}
+                      >
+                        Demote
+                      </button>
                     )}
                   </div>
                 </div>
@@ -2983,6 +3282,35 @@ const styles = {
     lineHeight: 1.4,
     marginTop: 6,
   },
+  usersToolbar: {
+    display: "flex",
+    gap: 8,
+    flexWrap: "wrap",
+  },
+  usersSummaryRow: {
+    marginTop: 12,
+    display: "grid",
+    gridTemplateColumns: "repeat(3, minmax(120px, 1fr))",
+    gap: 10,
+  },
+  usersSummaryCard: {
+    borderRadius: 12,
+    border: "1px solid var(--card-border)",
+    background: "var(--panel-bg)",
+    padding: "10px 12px",
+  },
+  usersSummaryLabel: {
+    fontSize: 12,
+    color: "var(--text-muted)",
+    textTransform: "uppercase",
+    letterSpacing: 0.6,
+  },
+  usersSummaryValue: {
+    marginTop: 4,
+    fontSize: 22,
+    fontWeight: 800,
+    lineHeight: 1,
+  },
   feedbackRow: {
     padding: "12px 14px",
     borderRadius: 12,
@@ -3040,14 +3368,15 @@ const styles = {
   },
   usersRow: {
     display: "grid",
-    gridTemplateColumns: "minmax(160px, 1.2fr) minmax(150px, 1fr) minmax(190px, 1.4fr) 110px 120px",
+    gridTemplateColumns:
+      "minmax(150px, 1.1fr) minmax(130px, 0.9fr) minmax(190px, 1.2fr) minmax(190px, 1.2fr) minmax(190px, 1.2fr) 90px 120px",
     gap: 10,
     alignItems: "center",
     padding: "10px 12px",
     borderRadius: 12,
     border: "1px solid var(--card-border)",
     background: "var(--panel-bg)",
-    minWidth: 720,
+    minWidth: 1080,
   },
   usersHeader: {
     fontSize: 12,
