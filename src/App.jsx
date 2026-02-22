@@ -98,7 +98,7 @@ async function fetchTableRowsWithAuth(tableName, accessToken, timeoutMs = 8000) 
 }
 
 async function mutateTableWithAuth(tableName, method, accessToken, options = {}) {
-  const { filter = {}, body = null, timeoutMs = 8000 } = options;
+  const { filter = {}, body = null, timeoutMs = 8000, returning = "minimal" } = options;
   const supabaseUrl = import.meta.env.VITE_SUPABASE_URL;
   const supabaseKey = import.meta.env.VITE_SUPABASE_ANON_KEY;
   if (!supabaseUrl || !supabaseKey) {
@@ -121,7 +121,7 @@ async function mutateTableWithAuth(tableName, method, accessToken, options = {})
     const headers = {
       apikey: supabaseKey,
       Authorization: `Bearer ${accessToken}`,
-      Prefer: "return=minimal",
+      Prefer: returning === "representation" ? "return=representation" : "return=minimal",
     };
     if (body !== null) headers["Content-Type"] = "application/json";
 
@@ -134,6 +134,10 @@ async function mutateTableWithAuth(tableName, method, accessToken, options = {})
     if (!res.ok) {
       const text = await res.text();
       throw new Error(`HTTP ${res.status} ${text.slice(0, 200)}`);
+    }
+    if (returning === "representation") {
+      const payload = await res.json();
+      return Array.isArray(payload) ? payload : [];
     }
     return true;
   } finally {
@@ -430,8 +434,8 @@ export default function App() {
   useEffect(() => {
     if (!toast) return;
     setToastLeaving(false);
-    const totalMs = 1800;
-    const leaveAtMs = 1580;
+    const totalMs = 15000;
+    const leaveAtMs = 14750;
     const tLeave = setTimeout(() => setToastLeaving(true), leaveAtMs);
     const tClear = setTimeout(() => {
       setToast("");
@@ -445,8 +449,7 @@ export default function App() {
 
   useEffect(() => {
     if (!authToast) return;
-    const isInvalidCred = /invalid login credentials/i.test(authToast);
-    const t = setTimeout(() => setAuthToast(""), isInvalidCred ? 60000 : 1800);
+    const t = setTimeout(() => setAuthToast(""), 15000);
     return () => clearTimeout(t);
   }, [authToast]);
 
@@ -766,14 +769,26 @@ export default function App() {
 
   async function promoteUserToAdmin(userId) {
     if (!isAdmin || !userId) return;
-    const { error } = await supabase
-      .from("user_profiles")
-      .update({ role: "admin" })
-      .eq("user_id", userId);
-    if (error) {
-      setToast("Role update error: " + error.message);
+    try {
+      const accessToken = await getAccessTokenOrThrow();
+      const updated = await mutateTableWithAuth("user_profiles", "PATCH", accessToken, {
+        filter: { user_id: userId },
+        body: { role: "admin" },
+        timeoutMs: 8000,
+        returning: "representation",
+      });
+      if (!Array.isArray(updated) || updated.length === 0) {
+        setToast("Role update blocked (RLS policy). Ask admin to allow role updates.");
+        return;
+      }
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : "Role update failed";
+      setToast("Role update error: " + msg);
       return;
     }
+    setUserDirectory((prev) =>
+      prev.map((u) => (String(u.user_id || "") === String(userId) ? { ...u, role: "admin" } : u))
+    );
     setToast("User promoted to admin");
     loadUserDirectory();
   }
@@ -1127,11 +1142,12 @@ export default function App() {
 
   async function addConsumable(e) {
     e.preventDefault();
+    const form = e.currentTarget;
     if (!isAdmin) {
       setToast("You don't have priviledge, please contact admin");
       return false;
     }
-    const fd = new FormData(e.currentTarget);
+    const fd = new FormData(form);
     const name = String(fd.get("name") || "").trim();
     if (!name) return false;
     const category = String(fd.get("category") || "").trim();
@@ -1174,7 +1190,7 @@ export default function App() {
         timeoutMs: 8000,
       });
 
-      e.currentTarget.reset();
+      form.reset();
       setToast("Consumable added");
       // Sync canonical values in background; keep optimistic row visible even if this hangs.
       loadConsumablesFromDb();
@@ -1233,11 +1249,9 @@ export default function App() {
     // Trigger notification only when stock crosses from above min to at/below min.
     const wasAboveMin = currentOnHand > minLevel;
     const isNowBelowMin = nextOnHand <= minLevel;
-    if (delta < 0 && !isAdmin) {
-      setToast("No email trigger: you are not admin.");
-    } else if (delta < 0 && !wasAboveMin) {
+    if (delta < 0 && !wasAboveMin && isAdmin) {
       setToast("No email trigger: item was already at/below min level.");
-    } else if (delta < 0 && wasAboveMin && !isNowBelowMin) {
+    } else if (delta < 0 && wasAboveMin && !isNowBelowMin && isAdmin) {
       setToast(`No email trigger: stock is still above min (${nextOnHand} > ${minLevel}).`);
     }
 
@@ -2503,7 +2517,7 @@ function ItemRow({ rowId, item, onToggle, onEdit, onDelete, canManage }) {
           ) : (
             <>
               <span style={styles.badge}>{item.tag || "No tag"}</span>
-              <span style={styles.badge}>{item.location || "No location"}</span>
+              <span style={{ ...styles.badge, ...styles.locationBadge }}>{item.location || "No location"}</span>
               <span style={styles.badge}>Qty {item.qty}</span>
               {item.note ? <span style={styles.badgeSoft}>{item.note}</span> : null}
 
@@ -3154,6 +3168,12 @@ const styles = {
     borderRadius: 999,
     border: "1px solid var(--field-border)",
     background: "var(--panel-bg)",
+  },
+  locationBadge: {
+    fontWeight: 700,
+    color: "var(--text-primary)",
+    border: "1px solid rgba(251, 191, 36, 0.62)",
+    background: "rgba(251, 191, 36, 0.16)",
   },
   badgeSoft: {
     fontSize: 12,
