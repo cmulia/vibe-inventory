@@ -44,6 +44,103 @@ function parseJsonSafely(str) {
   }
 }
 
+async function withTimeout(promise, ms, label) {
+  return Promise.race([
+    promise,
+    new Promise((_, reject) => {
+      setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms);
+    }),
+  ]);
+}
+
+function keepConsumableOrder(prev, next) {
+  const prevPos = new Map(prev.map((row, i) => [row.id, i]));
+  const nextPos = new Map(next.map((row, i) => [row.id, i]));
+  const tailBase = prev.length;
+  return [...next].sort((a, b) => {
+    const aPos = prevPos.has(a.id) ? prevPos.get(a.id) : tailBase + (nextPos.get(a.id) ?? 0);
+    const bPos = prevPos.has(b.id) ? prevPos.get(b.id) : tailBase + (nextPos.get(b.id) ?? 0);
+    return aPos - bPos;
+  });
+}
+
+async function fetchTableRowsWithAuth(tableName, accessToken, timeoutMs = 8000) {
+  const supabaseUrl = import.meta.env.VITE_SUPABASE_URL;
+  const supabaseKey = import.meta.env.VITE_SUPABASE_ANON_KEY;
+  if (!supabaseUrl || !supabaseKey) {
+    throw new Error("Missing Supabase env keys");
+  }
+  if (!accessToken) {
+    throw new Error("Missing auth access token");
+  }
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const url = `${supabaseUrl}/rest/v1/${tableName}?select=*`;
+    const res = await fetch(url, {
+      headers: {
+        apikey: supabaseKey,
+        Authorization: `Bearer ${accessToken}`,
+        "Content-Type": "application/json",
+      },
+      signal: controller.signal,
+    });
+    if (!res.ok) {
+      const body = await res.text();
+      throw new Error(`HTTP ${res.status} ${body.slice(0, 200)}`);
+    }
+    const payload = await res.json();
+    return Array.isArray(payload) ? payload : [];
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function mutateTableWithAuth(tableName, method, accessToken, options = {}) {
+  const { filter = {}, body = null, timeoutMs = 8000 } = options;
+  const supabaseUrl = import.meta.env.VITE_SUPABASE_URL;
+  const supabaseKey = import.meta.env.VITE_SUPABASE_ANON_KEY;
+  if (!supabaseUrl || !supabaseKey) {
+    throw new Error("Missing Supabase env keys");
+  }
+  if (!accessToken) {
+    throw new Error("Missing auth access token");
+  }
+
+  const params = new URLSearchParams();
+  for (const [key, value] of Object.entries(filter)) {
+    params.set(key, `eq.${String(value)}`);
+  }
+  const query = params.toString();
+  const url = `${supabaseUrl}/rest/v1/${tableName}${query ? `?${query}` : ""}`;
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const headers = {
+      apikey: supabaseKey,
+      Authorization: `Bearer ${accessToken}`,
+      Prefer: "return=minimal",
+    };
+    if (body !== null) headers["Content-Type"] = "application/json";
+
+    const res = await fetch(url, {
+      method,
+      headers,
+      body: body === null ? undefined : JSON.stringify(body),
+      signal: controller.signal,
+    });
+    if (!res.ok) {
+      const text = await res.text();
+      throw new Error(`HTTP ${res.status} ${text.slice(0, 200)}`);
+    }
+    return true;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 function normalizeUsername(u) {
   return String(u || "")
     .trim()
@@ -99,10 +196,14 @@ function mapDbItem(row, actorMap = {}) {
 
 async function loadProfileMapForActorIds(actorIds) {
   if (!actorIds.length) return {};
-  const { data, error } = await supabase
+  const { data, error } = await withTimeout(
+    supabase
     .from("user_profiles")
     .select("user_id,email")
-    .in("user_id", actorIds);
+    .in("user_id", actorIds),
+    8000,
+    "Profile map query"
+  );
   if (error || !Array.isArray(data)) return {};
 
   const out = {};
@@ -285,6 +386,8 @@ export default function App() {
   const [toast, setToast] = useState("");
   const [toastLeaving, setToastLeaving] = useState(false);
   const [feedbackRows, setFeedbackRows] = useState([]);
+  const [inventoryStatus, setInventoryStatus] = useState("");
+  const [consumablesStatus, setConsumablesStatus] = useState("");
   const [showFeedbackDialog, setShowFeedbackDialog] = useState(false);
   const [consumableJump, setConsumableJump] = useState(null);
   const [equipmentJump, setEquipmentJump] = useState(null);
@@ -297,6 +400,14 @@ export default function App() {
   const [addError, setAddError] = useState("");
   const [addDebug, setAddDebug] = useState("");
   const fileRef = useRef(null);
+
+  async function getAccessTokenOrThrow() {
+    if (authAccessToken) return authAccessToken;
+    const { data, error } = await supabase.auth.getSession();
+    const token = data?.session?.access_token || "";
+    if (error || !token) throw new Error("Missing auth session. Please log in again.");
+    return token;
+  }
 
   // Load data once user identity/session is ready.
   useEffect(() => {
@@ -402,41 +513,71 @@ export default function App() {
   }, [currentUser, isAdmin]);
 
   async function loadInventoryFromDb() {
-  const { data, error } = await supabase
-    .from("inventory_items")
-    .select("id, created_at, item_name, tag, location, qty, checked, notes, created_by, updated_at, updated_by")
-    .order("created_at", { ascending: false });
-
-  if (error) {
-    setToast("Load error: " + error.message);
-    return;
-  }
-
-  const rows = data || [];
-  const actorIds = Array.from(
-    new Set(
-      rows
-        .flatMap((r) => [r.created_by, r.updated_by])
-        .filter(Boolean)
-        .map((v) => String(v))
-    )
-  );
-  const actorMap = await loadProfileMapForActorIds(actorIds);
-  if (authIdentity?.id && authIdentity?.email) {
-    actorMap[authIdentity.id] = actorDisplayName(authIdentity.email);
-  }
-  const mapped = rows.map((r) => mapDbItem(r, actorMap));
-
-  setItems(mapped);
-}
-
-  async function loadConsumablesFromDb() {
-    const { data, error } = await supabase.from("consumables_items").select("*");
-    if (error) {
-      setToast("Consumables load error: " + error.message);
+    setInventoryStatus("Inventory loading...");
+    let rows = [];
+    try {
+      let accessToken = authAccessToken;
+      if (!accessToken) {
+        const { data: sessionData } = await supabase.auth.getSession();
+        accessToken = sessionData?.session?.access_token || "";
+      }
+      rows = await fetchTableRowsWithAuth("inventory_items", accessToken, 8000);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : "Inventory query failed";
+      setInventoryStatus(`Inventory load failed: ${msg}`);
+      setToast(`Load error: ${msg}`);
       return;
     }
-    const rows = Array.isArray(data) ? data : [];
+    const actorIds = Array.from(
+      new Set(
+        rows
+          .flatMap((r) => [r.created_by, r.updated_by, r.createdBy, r.updatedBy])
+          .filter(Boolean)
+          .map((v) => String(v))
+      )
+    );
+    const actorMap = await loadProfileMapForActorIds(actorIds);
+    if (authIdentity?.id && authIdentity?.email) {
+      actorMap[authIdentity.id] = actorDisplayName(authIdentity.email);
+    }
+    const mapped = rows.map((r) => {
+      const createdByRaw = String(r.created_by ?? r.createdBy ?? "?");
+      const updatedByRaw = String(r.updated_by ?? r.updatedBy ?? r.created_by ?? r.createdBy ?? "?");
+      return {
+        id: String(r.id ?? genUuid()),
+        name: String(r.item_name ?? r.name ?? ""),
+        tag: String(r.tag ?? ""),
+        location: String(r.location ?? ""),
+        qty: Number(r.qty ?? r.quantity ?? 1) || 1,
+        checked: !!r.checked,
+        note: String(r.notes ?? r.note ?? ""),
+        createdBy: actorDisplayName(actorMap[createdByRaw] || createdByRaw),
+        createdAt: r.created_at ? new Date(r.created_at).getTime() : Date.now(),
+        updatedBy: actorDisplayName(actorMap[updatedByRaw] || updatedByRaw),
+        updatedAt: r.updated_at ? new Date(r.updated_at).getTime() : Date.now(),
+      };
+    });
+
+    setItems(mapped);
+    setInventoryStatus(`Inventory rows: ${mapped.length}`);
+  }
+
+  async function loadConsumablesFromDb() {
+    setConsumablesStatus("Consumables loading...");
+    let rows = [];
+    try {
+      let accessToken = authAccessToken;
+      if (!accessToken) {
+        const { data: sessionData } = await supabase.auth.getSession();
+        accessToken = sessionData?.session?.access_token || "";
+      }
+      rows = await fetchTableRowsWithAuth("consumables_items", accessToken, 8000);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : "Consumables query failed";
+      setConsumablesStatus(`Consumables load failed: ${msg}`);
+      setToast(`Consumables load error: ${msg}`);
+      return;
+    }
 
     if (rows.length === 0) {
       const legacy = loadConsumables();
@@ -478,7 +619,8 @@ export default function App() {
           : Date.now(),
     }));
 
-    setConsumables(mapped);
+    setConsumables((prev) => keepConsumableOrder(prev, mapped));
+    setConsumablesStatus(`Consumables rows: ${mapped.length}`);
   }
 
   async function loadFeedbacksFromDb() {
@@ -1026,12 +1168,11 @@ export default function App() {
     setConsumables((prev) => [optimistic, ...prev.filter((x) => x.id !== id)]);
 
     try {
-      const { error } = await supabase.from("consumables_items").insert([row], { returning: "minimal" });
-      if (error) {
-        setConsumables((prev) => prev.filter((x) => x.id !== id));
-        setToast("Consumable add error: " + error.message);
-        return false;
-      }
+      const accessToken = await getAccessTokenOrThrow();
+      await mutateTableWithAuth("consumables_items", "POST", accessToken, {
+        body: [row],
+        timeoutMs: 8000,
+      });
 
       e.currentTarget.reset();
       setToast("Consumable added");
@@ -1055,20 +1196,39 @@ export default function App() {
     const nextOnHand = Math.max(0, Number(current.onHand || 0) + delta);
     const currentOnHand = Number(current.onHand || 0);
     const minLevel = Number(current.minLevel || 0);
+    const updatedAt = Date.now();
 
-    const { error } = await supabase
-      .from("consumables_items")
-      .update({
+    try {
+      const accessToken = await getAccessTokenOrThrow();
+      await mutateTableWithAuth("consumables_items", "PATCH", accessToken, {
+        filter: { id },
+        body: {
         on_hand: nextOnHand,
         updated_at: new Date().toISOString(),
         updated_by_name: currentName || currentUser || "Unknown",
         updated_by_username: currentUser || "unknown",
-      })
-      .eq("id", id);
-    if (error) {
-      setToast("Consumable update error: " + error.message);
+        },
+        timeoutMs: 8000,
+      });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : "Update failed";
+      setToast("Consumable update error: " + msg);
       return;
     }
+
+    setConsumables((prev) =>
+      prev.map((c) =>
+        c.id === id
+          ? {
+              ...c,
+              onHand: nextOnHand,
+              changedByName: currentName || currentUser || "Unknown",
+              changedByUsername: currentUser || "unknown",
+              updatedAt,
+            }
+          : c
+      )
+    );
 
     // Trigger notification only when stock crosses from above min to at/below min.
     const wasAboveMin = currentOnHand > minLevel;
@@ -1141,7 +1301,7 @@ export default function App() {
       }
     }
 
-    await loadConsumablesFromDb();
+    loadConsumablesFromDb();
   }
 
   async function removeConsumable(id) {
@@ -1149,9 +1309,15 @@ export default function App() {
       setToast("You don't have priviledge, please contact admin");
       return;
     }
-    const { error } = await supabase.from("consumables_items").delete().eq("id", id);
-    if (error) {
-      setToast("Consumable delete error: " + error.message);
+    try {
+      const accessToken = await getAccessTokenOrThrow();
+      await mutateTableWithAuth("consumables_items", "DELETE", accessToken, {
+        filter: { id },
+        timeoutMs: 8000,
+      });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : "Delete failed";
+      setToast("Consumable delete error: " + msg);
       return;
     }
     await loadConsumablesFromDb();
@@ -1335,6 +1501,9 @@ export default function App() {
         if (!res?.ok) setAuthToast(`Profile sync failed: ${res.error}`);
       });
       refreshAdminRole(s.user?.id, identityAdmin);
+      loadInventoryFromDb();
+      loadConsumablesFromDb();
+      loadFeedbacksFromDb();
     });
 
     const { data: sub } = supabase.auth.onAuthStateChange(async (_event, session) => {
@@ -1357,6 +1526,11 @@ export default function App() {
         setAuthToast(`Profile sync failed: ${profileResult.error}`);
       }
       await refreshAdminRole(session?.user?.id, identityAdmin);
+      if (session?.user?.id) {
+        loadInventoryFromDb();
+        loadConsumablesFromDb();
+        loadFeedbacksFromDb();
+      }
     });
 
     return () => sub.subscription.unsubscribe();
@@ -1396,6 +1570,11 @@ export default function App() {
                 Logout
               </button>
             </div>
+            {isAdmin ? (
+              <div style={{ ...styles.sub, marginTop: 6, opacity: 0.8 }}>
+                {inventoryStatus || "Inventory rows: ?"} | {consumablesStatus || "Consumables rows: ?"}
+              </div>
+            ) : null}
           </div>
 
           <div style={styles.statsRow}>
