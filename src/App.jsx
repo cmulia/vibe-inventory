@@ -298,21 +298,20 @@ export default function App() {
   const [addDebug, setAddDebug] = useState("");
   const fileRef = useRef(null);
 
-  // Load data once user identity is ready. Including authIdentity helps avoid
-  // an empty first load during session rehydration after refresh.
+  // Load data once user identity/session is ready.
   useEffect(() => {
     if (!currentUser) return;
     loadInventoryFromDb();
     loadConsumablesFromDb();
     loadFeedbacksFromDb();
-  }, [currentUser, authIdentity.id]);
+  }, [currentUser, authIdentity.id, authAccessToken]);
 
   // Always refresh consumables when navigating to the consumables tab.
   useEffect(() => {
     if (!currentUser) return;
     if (activePage !== "consumables") return;
     loadConsumablesFromDb();
-  }, [activePage, currentUser, authIdentity.id]);
+  }, [activePage, currentUser, authIdentity.id, authAccessToken]);
 
 
   // persist inventory when items change
@@ -432,38 +431,12 @@ export default function App() {
 }
 
   async function loadConsumablesFromDb() {
-    try {
-      const supabaseUrl = import.meta.env.VITE_SUPABASE_URL;
-      const supabaseKey = import.meta.env.VITE_SUPABASE_ANON_KEY;
-      if (!supabaseUrl || !supabaseKey) {
-        setToast("Consumables load error: missing Supabase env keys");
-        return;
-      }
-
-      const { data: sessionData, error: sessionError } = await supabase.auth.getSession();
-      const accessToken = sessionData?.session?.access_token || "";
-      if (sessionError || !accessToken) {
-        setConsumables([]);
-        setToast("Consumables load error: missing auth session. Please log in again.");
-        return;
-      }
-
-      const url = `${supabaseUrl}/rest/v1/consumables_items?select=*`;
-      const res = await fetch(url, {
-        headers: {
-          apikey: supabaseKey,
-          Authorization: `Bearer ${accessToken}`,
-          "Content-Type": "application/json",
-        },
-      });
-      if (!res.ok) {
-        const body = await res.text();
-        setToast(`Consumables load error: HTTP ${res.status} ${body.slice(0, 140)}`);
-        return;
-      }
-
-      const payload = await res.json();
-      const rows = Array.isArray(payload) ? payload : [];
+    const { data, error } = await supabase.from("consumables_items").select("*");
+    if (error) {
+      setToast("Consumables load error: " + error.message);
+      return;
+    }
+    const rows = Array.isArray(data) ? data : [];
 
     if (rows.length === 0) {
       const legacy = loadConsumables();
@@ -506,10 +479,6 @@ export default function App() {
     }));
 
     setConsumables(mapped);
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : "Unknown error";
-      setToast("Consumables load error: " + msg);
-    }
   }
 
   async function loadFeedbacksFromDb() {
